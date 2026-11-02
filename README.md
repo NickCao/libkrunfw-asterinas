@@ -2,8 +2,8 @@
 
 An x86-64 proof of concept running Asterinas with **Fedora's unmodified Podman,
 crun-krun and libkrun packages**. This RPM provides `libkrunfw.so.5` and replaces
-Fedora's Linux firmware package. It uses the upstream prebuilt Asterinas kernel
-pinned in [upstream.json](upstream.json); no kernel or VMM is compiled from source.
+Fedora's Linux firmware package. It compiles the Asterinas kernel and its matching
+OSDK from the source revision pinned in [upstream.json](upstream.json).
 
 The acceptance test runs the **unmodified `docker.io/library/nginx:stable` image**
 and fetches its welcome page from the host. It uses virtio-net through passt,
@@ -17,17 +17,40 @@ bash tools/build-rpm.sh
 
 All compilation and RPM assembly happen inside Fedora 44. The build host needs
 Podman; `CONTAINER_ENGINE=docker` selects Docker instead. KVM is needed for tests.
-The checksum-verified upstream artifact is cached under `.cache/`.
+The builder installs Asterinas's pinned Rust nightly with `rust-src`, `rustc-dev`,
+LLVM tools and the bare-metal x86-64 target. Source archives and Cargo downloads
+are cached under `.cache/`. Compilation uses two jobs by default;
+`KERNEL_BUILD_JOBS` changes this for machines with more memory.
 
 Binary RPMs are written to `dist/rpmbuild/RPMS/x86_64/`, and SRPMs to
-`dist/rpmbuild/SRPMS/`. The SRPM contains the prebuilt kernel and all wrapper source
-needed to rebuild offline inside the prepared Fedora builder.
+`dist/rpmbuild/SRPMS/`. The SRPM contains the checksum-verified Asterinas source
+archive, the vDSO input archive, and the wrapper source. Its build stage compiles
+OSDK and the kernel inside the prepared Fedora builder; the first build needs
+network access for Cargo dependencies. The vDSO archive contains upstream's
+precompiled Linux vDSO libraries, which are still used as kernel build inputs.
+
+The kernel uses the upstream development profile, the `vmm-direct` boot method,
+and 64-page task stacks. This step keeps the same upstream kernel revision as the
+previous prebuilt PoC. It adds no console or networking patches. The installed
+`/usr/share/libkrunfw-asterinas/kernel-build.json` records the source and kernel
+hashes, compiler version and build settings; `kernel-Cargo.lock` records the
+dependencies resolved for the generated OSDK kernel crate.
+
+For an incremental kernel-only build with the prepared builder:
+
+```sh
+podman run --rm -v "$PWD:/work:Z" -w /work \
+    localhost/libkrunfw-asterinas-build:44 make kernel
+```
+
+Use `/work` as the mount point: upstream component registration currently breaks
+when a parent path contains `src/`. The RPM build script handles this.
 
 ## Install and run nginx on Fedora
 
 ```sh
 sudo dnf install podman crun-krun passt
-sudo dnf install --allowerasing ./dist/rpmbuild/RPMS/x86_64/libkrunfw-asterinas-0.1.0-2.fc44.x86_64.rpm
+sudo dnf install --allowerasing ./dist/rpmbuild/RPMS/x86_64/libkrunfw-asterinas-0.1.0-3.fc44.x86_64.rpm
 
 sudo podman network create --subnet 10.0.2.0/24 --gateway 10.0.2.2 asterinas
 sudo podman run -d --name asterinas-nginx --runtime /usr/bin/krun \
@@ -119,7 +142,7 @@ The host launcher observes `ASTERINAS_POC_EXIT=<status>` on serial output, kills
 the VM, and returns that status. Workloads must not print that reserved control
 line; this is not a secure process-supervision protocol.
 
-The wrapper and bootstrap are MIT licensed; the prebuilt kernel is MPL-2.0.
+The wrapper and bootstrap are MIT licensed; the Asterinas kernel is MPL-2.0.
 The initramfs contains Fedora glibc and json-c runtime libraries, with license
 notices included in the RPM. Provenance is recorded in `upstream.json` and the
-generated `layout.json`.
+generated `kernel-build.json`, `kernel-Cargo.lock`, and `layout.json`.

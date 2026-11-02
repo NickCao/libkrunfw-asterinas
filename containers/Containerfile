@@ -3,4 +3,19 @@ FROM registry.fedoraproject.org/fedora:${FEDORA_VERSION}
 RUN dnf -y install gcc make binutils rpm-build python3 tar zstd \
         json-c-devel libkrun-devel crun-krun podman file \
     && dnf clean all
+RUN dnf -y install git clang openssl-devel pkgconf-pkg-config xz \
+    && dnf clean all
+ARG RUST_TOOLCHAIN=nightly-2026-07-21
+ENV PATH="/root/.cargo/bin:${PATH}"
+ENV RUSTUP_TOOLCHAIN=${RUST_TOOLCHAIN}
+# Pinned rustup installer; the compiler version follows Asterinas's toolchain.
+RUN curl --fail --location --retry 3 \
+        https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
+        -o /tmp/rustup-init \
+    && echo '20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c  /tmp/rustup-init' | sha256sum -c - \
+    && chmod +x /tmp/rustup-init \
+    && /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain none \
+    && rm /tmp/rustup-init \
+    && rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal \
+        --component rust-src,rustc-dev,llvm-tools-preview --target x86_64-unknown-none
 WORKDIR /src

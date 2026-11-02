@@ -1,10 +1,26 @@
 {
   "asterinas_version": "0.19.0",
   "asterinas_commit": "7861bff17133b941cf89329917033541d14813ab",
-  "url": "https://github.com/asterinas/kata-containers/releases/download/3.28.0-20261102-asterinas/kata-static-3.28.0-asterinas-amd64.tar.zst",
-  "sha256": "a7072160700a77c83fc11898bb4a3114691d8c4febec441c6305c6c6114ccdea",
-  "member": "./opt/kata/share/kata-containers/aster-kernel-osdk-bin.qemu_elf",
-  "kernel_sha256": "653efaa8d1c1130d1e6f06c479acc7c32e0153f781e7a477a8cb6bfe22ee58f2",
   "libkrunfw_abi": 5,
-  "fedora": 44
+  "fedora": 44,
+  "source": {
+    "url": "https://codeload.github.com/asterinas/asterinas/tar.gz/7861bff17133b941cf89329917033541d14813ab",
+    "archive": "asterinas-7861bff17133b941cf89329917033541d14813ab.tar.gz",
+    "sha256": "dc536655468586d50eb9392cc48c9900abe136d677584a30f4e851756c621d0f",
+    "directory": "asterinas-7861bff17133b941cf89329917033541d14813ab"
+  },
+  "vdso": {
+    "commit": "8af571775a3d3a1df3e84fc9709b9d6b160c771a",
+    "url": "https://codeload.github.com/asterinas/linux_vdso/tar.gz/8af571775a3d3a1df3e84fc9709b9d6b160c771a",
+    "archive": "linux-vdso-8af571775a3d3a1df3e84fc9709b9d6b160c771a.tar.gz",
+    "sha256": "ce018ab2f2ea84859e6a1e1f099abf093cb46e4250a4806b85aeaa8949017fcf",
+    "directory": "linux_vdso-8af571775a3d3a1df3e84fc9709b9d6b160c771a"
+  },
+  "rust_toolchain": "nightly-2026-07-21",
+  "kernel_build": {
+    "arch": "x86_64",
+    "boot_method": "vmm-direct",
+    "profile": "dev",
+    "stack_pages": 64
+  }
 }

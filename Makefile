@@ -3,11 +3,14 @@ BUILD ?= build
 CC ?= gcc
 CFLAGS ?= -O2 -g -Wall -Wextra
 
-.PHONY: all check clean
+.PHONY: all kernel check clean
 all: $(BUILD)/libkrunfw.so.5 $(BUILD)/run
 
-$(BUILD)/asterinas.elf: upstream.json tools/fetch-kernel.py
-	python3 tools/fetch-kernel.py --output $@
+kernel:
+	bash tools/build-kernel.sh
+
+$(BUILD)/asterinas.elf: upstream.json tools/build-kernel.sh tools/fetch-sources.py
+	bash tools/build-kernel.sh
 
 $(BUILD)/init: src/init.c
 	mkdir -p $(BUILD)

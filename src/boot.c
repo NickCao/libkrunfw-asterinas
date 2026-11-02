@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MIT */
-/* Runs inside the VM, before entering the unmodified prebuilt kernel. */
+/* Runs inside the VM, before entering the Asterinas kernel. */
 #include <stddef.h>
 #include <stdint.h>
 #include "layout.h"
