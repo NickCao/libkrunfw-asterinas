@@ -1,0 +1,6 @@
+ARG FEDORA_VERSION=44
+FROM registry.fedoraproject.org/fedora:${FEDORA_VERSION}
+RUN dnf -y install gcc make binutils rpm-build python3 tar zstd \
+        json-c-devel libkrun-devel crun-krun podman file \
+    && dnf clean all
+WORKDIR /src

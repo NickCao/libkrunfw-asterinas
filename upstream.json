@@ -1,0 +1,10 @@
+{
+  "asterinas_version": "0.19.0",
+  "asterinas_commit": "7861bff17133b941cf89329917033541d14813ab",
+  "url": "https://github.com/asterinas/kata-containers/releases/download/3.28.0-20261102-asterinas/kata-static-3.28.0-asterinas-amd64.tar.zst",
+  "sha256": "a7072160700a77c83fc11898bb4a3114691d8c4febec441c6305c6c6114ccdea",
+  "member": "./opt/kata/share/kata-containers/aster-kernel-osdk-bin.qemu_elf",
+  "kernel_sha256": "653efaa8d1c1130d1e6f06c479acc7c32e0153f781e7a477a8cb6bfe22ee58f2",
+  "libkrunfw_abi": 5,
+  "fedora": 44
+}
