@@ -9,7 +9,7 @@ tar --sort=name --mtime='2026-11-02 00:00:00Z' --owner=0 --group=0 --numeric-own
     --exclude='__pycache__' --exclude='*.pyc' \
     --transform='s,^,libkrunfw-asterinas-0.1.0/,' \
     -czf "$topdir/SOURCES/libkrunfw-asterinas-0.1.0.tar.gz" \
-    LICENSE README.md Makefile upstream.json src bin tools tests containers packaging licenses examples
+    LICENSE README.md Makefile upstream.json src bin tools tests containers packaging licenses examples patches
 python3 - "$topdir/SOURCES" <<'PY'
 import json, pathlib, shutil, sys
 lock = json.load(open("upstream.json"))

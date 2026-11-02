@@ -3,7 +3,7 @@
 %global vdso_commit 8af571775a3d3a1df3e84fc9709b9d6b160c771a
 Name:           libkrunfw-asterinas
 Version:        0.1.0
-Release:        3%{?dist}
+Release:        4%{?dist}
 Summary:        Experimental Asterinas guest payload for libkrun
 License:        MIT AND MPL-2.0 AND LGPL-2.1-or-later
 URL:            https://github.com/NickCao/libkrunfw-asterinas
@@ -21,6 +21,7 @@ BuildRequires:  clang
 BuildRequires:  git
 BuildRequires:  openssl-devel
 BuildRequires:  pkgconf-pkg-config
+BuildRequires:  patch
 # The supplied Fedora builder also installs the Rust nightly, rust-src,
 # rustc-dev and llvm-tools components pinned in upstream.json.
 Requires:       libkrun >= 1.19.6
@@ -64,6 +65,7 @@ install -Dpm0644 upstream.json %{buildroot}%{_datadir}/%{name}/upstream.json
 install -Dpm0644 build/kernel-build.json %{buildroot}%{_datadir}/%{name}/kernel-build.json
 install -Dpm0644 build/kernel-Cargo.lock %{buildroot}%{_datadir}/%{name}/kernel-Cargo.lock
 install -Dpm0644 examples/nginx.conf %{buildroot}%{_datadir}/%{name}/nginx.conf
+cp -a patches %{buildroot}%{_datadir}/%{name}/patches
 
 %files
 %license LICENSE licenses/ASTERINAS-MPL-2.0 licenses/guest-glibc licenses/guest-json-c
@@ -74,6 +76,10 @@ install -Dpm0644 examples/nginx.conf %{buildroot}%{_datadir}/%{name}/nginx.conf
 %{_datadir}/%{name}/
 
 %changelog
+* Mon Nov 02 2026 Nick Cao <nickcao@nichi.co> - 0.1.0-4
+- Add Asterinas multiport virtio-console queues, control messages and raw ports
+- Route OCI stdio through stock krun's console and named pipe ports
+
 * Mon Nov 02 2026 Nick Cao <nickcao@nichi.co> - 0.1.0-3
 - Compile the pinned Asterinas kernel and OSDK from source inside the Fedora builder
 - Include source archives in the SRPM and record the kernel build provenance

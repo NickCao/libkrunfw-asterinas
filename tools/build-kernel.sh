@@ -42,6 +42,16 @@ source = pathlib.Path(sys.argv[1])
 assert (source / "VERSION").read_text().strip() == lock["asterinas_version"]
 assert tomllib.loads((source / "rust-toolchain.toml").read_text())["toolchain"]["channel"] == lock["rust_toolchain"]
 PY
+# Apply the same reviewable patch series to extracted sources and SRPM builds.
+while IFS= read -r patch_name; do
+    [[ -z "$patch_name" || "$patch_name" == \#* ]] && continue
+    patch_file="$project_dir/patches/$patch_name"
+    if (cd "$source_dir" && patch --dry-run --reverse --force --silent --fuzz=0 -p1 < "$patch_file") >/dev/null 2>&1; then
+        echo "Already applied: $patch_name"
+    else
+        (cd "$source_dir" && patch --batch --forward --fuzz=0 -p1 < "$patch_file")
+    fi
+done < "$project_dir/patches/series"
 # Build the matching OSDK rather than using a potentially different installed one.
 OSDK_LOCAL_DEV=1 cargo build --locked --release --manifest-path "$source_dir/osdk/Cargo.toml"
 export PATH="$CARGO_TARGET_DIR/release:$PATH"
@@ -72,6 +82,11 @@ manifest = {
     "vdso_sha256": lock["vdso"]["sha256"],
     "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
     "kernel_build": lock["kernel_build"],
+    "patches": [
+        {"name": name, "sha256": hashlib.sha256((pathlib.Path("patches") / name).read_bytes()).hexdigest()}
+        for name in pathlib.Path("patches/series").read_text().splitlines()
+        if name and not name.startswith("#")
+    ],
     "kernel_sha256": hashlib.file_digest(kernel.open("rb"), "sha256").hexdigest(),
     "cargo_lock_sha256": hashlib.file_digest(pathlib.Path("build/kernel-Cargo.lock").open("rb"), "sha256").hexdigest(),
 }

@@ -3,7 +3,8 @@
 An x86-64 proof of concept running Asterinas with **Fedora's unmodified Podman,
 crun-krun and libkrun packages**. This RPM provides `libkrunfw.so.5` and replaces
 Fedora's Linux firmware package. It compiles the Asterinas kernel and its matching
-OSDK from the source revision pinned in [upstream.json](upstream.json).
+OSDK from the source revision pinned in [upstream.json](upstream.json), with the
+kernel patches listed in [patches/series](patches/series).
 
 The acceptance test runs the **unmodified `docker.io/library/nginx:stable` image**
 and fetches its welcome page from the host. It uses virtio-net through passt,
@@ -31,10 +32,12 @@ precompiled Linux vDSO libraries, which are still used as kernel build inputs.
 
 The kernel uses the upstream development profile, the `vmm-direct` boot method,
 and 64-page task stacks. This step keeps the same upstream kernel revision as the
-previous prebuilt PoC. It adds no console or networking patches. The installed
+previous prebuilt PoC. The multiport console patch is applied during both local
+and RPM builds. The installed
 `/usr/share/libkrunfw-asterinas/kernel-build.json` records the source and kernel
 hashes, compiler version and build settings; `kernel-Cargo.lock` records the
-dependencies resolved for the generated OSDK kernel crate.
+dependencies resolved for the generated OSDK kernel crate. Patch hashes are
+included in the build record, and the RPM installs the patch series alongside it.
 
 For an incremental kernel-only build with the prepared builder:
 
@@ -50,7 +53,7 @@ when a parent path contains `src/`. The RPM build script handles this.
 
 ```sh
 sudo dnf install podman crun-krun passt
-sudo dnf install --allowerasing ./dist/rpmbuild/RPMS/x86_64/libkrunfw-asterinas-0.1.0-3.fc44.x86_64.rpm
+sudo dnf install --allowerasing ./dist/rpmbuild/RPMS/x86_64/libkrunfw-asterinas-0.1.0-4.fc44.x86_64.rpm
 
 sudo podman network create --subnet 10.0.2.0/24 --gateway 10.0.2.2 asterinas
 sudo podman run -d --name asterinas-nginx --runtime /usr/bin/krun \
@@ -81,22 +84,34 @@ also avoids privileged-port restrictions on passt's forwarding sockets.
 view. Guest processes still run inside the VM. This PoC uses one vCPU and 1 GiB
 RAM; rootless operation and Fedora host SELinux enforcement are not validated.
 
-## Current limitations
+## Console support and current limitations
 
-Asterinas's virtio console supports one port; libkrun's default console requires
-multiport negotiation. Boot code leaves that device unbound, allowing stock krun
-to boot without a console. The guest bootstrap writes stdout/stderr to
-`/.asterinas.log` in the container's writable layer:
+The patched driver negotiates virtio-console multiport, exchanges device/port
+readiness messages, and gives each port independent receive/transmit queues.
+`/dev/hvc0` uses the existing TTY line discipline. Raw `/dev/vport0pN` devices
+carry krun's named `krun-stdin`, `krun-stdout`, and `krun-stderr` streams without
+terminal processing. The bootstrap selects streams by name, rather than assuming
+fixed port numbers, and creates the corresponding `/dev/virtio-ports/` aliases.
+
+Container output is available through normal Podman logging:
 
 ```sh
-rootfs=$(sudo podman mount asterinas-nginx)
-sudo cat "$rootfs/.asterinas.log"
+sudo podman logs asterinas-nginx
 sudo podman kill asterinas-nginx
 sudo podman rm asterinas-nginx
 ```
 
-`podman logs`, interactive input, guest exec, graceful guest signal delivery, and
-guest exit-status propagation are not implemented. A completed guest command
+The raw ports preserve host EOF and use bounded queues with readiness-based
+blocking for backpressure. Console resize messages update the TTY size and
+signal its foreground process group. Kernel diagnostic output is best effort
+when its console queue fills, so logging cannot wait on host I/O with interrupts
+disabled. The PoC supports one console and up to 32 ports per device, with ports
+opened during discovery. General hotplug/reopen handling is not implemented.
+Port-name discovery currently uses a private bootstrap ioctl; sysfs/udev port
+discovery remains future work.
+
+Guest exec, graceful guest signal delivery, and guest exit-status propagation
+are not implemented. A completed guest command
 leaves the Podman VM running until killed. The PoC supports root guest commands,
 one container at the fixed network address, and IPv4. Nginx reports unavailable
 Linux AIO (`io_setup`) and continues using epoll and ordinary file I/O.
@@ -111,7 +126,7 @@ bash tools/nginx-test.sh
 Tests require rootful Podman/Docker and `/dev/kvm`. Both install the built RPM in
 a disposable Fedora container. The nginx test verifies that stock libkrunfw was
 removed, the packaged libkrun and krun files were not modified, a host HTTP request
-returns nginx's welcome page, and that request appears in the Asterinas guest log.
+returns nginx's welcome page, and that request appears in `podman logs`.
 Versions, image digest, response, and logs are saved under `build/nginx-*`.
 
 `KEEP_TEST_CONTAINER=1` leaves the successful nginx test serving on host port
@@ -120,6 +135,12 @@ provides the test environment on a non-Fedora build host. The inner Podman
 workload uses the normal capability set. These tests do not validate a native
 Fedora host's SELinux policy. An outdated Debian AppArmor profile for passt can
 also block a newer Fedora passt binary before the VM starts.
+
+For a small console smoke check, run `python3 tools/console-test.py CONTAINER`
+with the Fedora container name printed by a retained nginx test. It checks
+separate stdout/stderr, a 32 KiB binary stdin round trip and EOF, plus interactive
+console input and initial terminal dimensions. Logs are saved under
+`build/console-*`.
 
 `make check` inside the Fedora builder verifies the firmware ABI, alignment,
 unchanged ELF segments, Linux64 entry, ACPI checksums, and initramfs headers.

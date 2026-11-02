@@ -1,0 +1,1353 @@
+--- a/kernel/core/comps/virtio/src/device/console/device.rs
++++ b/kernel/core/comps/virtio/src/device/console/device.rs
+@@ -1,188 +1,198 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+-use alloc::{boxed::Box, fmt::Debug, string::ToString, sync::Arc, vec::Vec};
+-use core::hint::spin_loop;
++//! Virtio console discovery and multiport control messages.
+ 
+-use aster_console::{AnyConsoleDevice, ConsoleCallback};
+-use aster_util::mem_obj_slice::Slice;
++use alloc::{boxed::Box, string::ToString, sync::Arc, vec::Vec};
++
+ use ostd::{
+     arch::trap::TrapFrame,
+-    debug,
+-    mm::{VmReader, dma::DmaStream, io::util::HasVmReaderWriter},
+-    sync::{Rcu, SpinLock},
++    sync::{LocalIrqDisabled, SpinLock},
+ };
+ 
+-use super::{DEVICE_NAME, config::VirtioConsoleConfig};
++use super::{
++    DEVICE_NAME,
++    config::{ConsoleFeatures, VirtioConsoleConfig},
++    control::{ControlMessage, ControlQueues, event},
++    port::ConsolePort,
++};
+ use crate::{
+-    device::{VirtioDeviceError, console::config::ConsoleFeatures},
+-    queue::VirtQueue,
++    device::VirtioDeviceError,
+     transport::{ConfigManager, DeviceTransport},
+ };
+ 
+-pub struct ConsoleDevice {
+-    config_manager: ConfigManager<VirtioConsoleConfig>,
+-    transport: SpinLock<DeviceTransport>,
+-    receive_queue: SpinLock<VirtQueue>,
+-    transmit_queue: SpinLock<VirtQueue>,
+-    send_buffer: DmaStream,
+-    receive_buffer: DmaStream,
+-    #[expect(clippy::box_collection)]
+-    callbacks: Rcu<Box<Vec<&'static ConsoleCallback>>>,
++static DEVICES: SpinLock<Vec<Arc<ConsoleDevice>>, LocalIrqDisabled> = SpinLock::new(Vec::new());
++
++/// Returns all ports, including ports not yet announced by the host.
++pub fn ports() -> Vec<Arc<ConsolePort>> {
++    DEVICES
++        .lock()
++        .iter()
++        .flat_map(|device| device.ports.iter().cloned())
++        .collect()
+ }
+ 
+-impl AnyConsoleDevice for ConsoleDevice {
+-    fn send(&self, value: &[u8]) {
+-        let mut transmit_queue = self.transmit_queue.disable_irq().lock();
+-        let mut reader = VmReader::from(value);
+-
+-        while reader.remain() > 0 {
+-            let mut writer = self.send_buffer.writer().unwrap();
+-            let len = writer.write(&mut reader);
+-            self.send_buffer.sync_to_device(0..len).unwrap();
+-
+-            let slice = Slice::new(&self.send_buffer, 0..len);
+-            transmit_queue.add_input_bufs(&[&slice]).unwrap();
+-
+-            if transmit_queue.should_notify() {
+-                transmit_queue.notify();
+-            }
+-            while transmit_queue.pop_used().is_err() {
+-                spin_loop();
+-            }
+-        }
+-    }
+-
+-    fn register_callback(&self, callback: &'static ConsoleCallback) {
+-        loop {
+-            let callbacks = self.callbacks.read();
+-            let mut callbacks_cloned = callbacks.get().clone();
+-            callbacks_cloned.push(callback);
+-            if callbacks.compare_exchange(callbacks_cloned).is_ok() {
+-                break;
+-            }
+-            // Contention on pushing, retry.
+-            spin_loop();
+-        }
+-    }
+-}
+-
+-impl Debug for ConsoleDevice {
+-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+-        f.debug_struct("ConsoleDevice")
+-            .field("config", &self.config_manager.read_config())
+-            .field("transport", &self.transport)
+-            .field("receive_queue", &self.receive_queue)
+-            .field("transmit_queue", &self.transmit_queue)
+-            .finish()
+-    }
++pub struct ConsoleDevice {
++    config: ConfigManager<VirtioConsoleConfig>,
++    transport: SpinLock<DeviceTransport>,
++    ports: Vec<Arc<ConsolePort>>,
++    control: Option<SpinLock<ControlQueues, LocalIrqDisabled>>,
+ }
+ 
+ impl ConsoleDevice {
+     pub(crate) fn negotiate_features(features: u64) -> u64 {
+-        let mut features = ConsoleFeatures::from_bits_truncate(features);
+-        // A virtio console device may have multiple ports, but we only use one port to communicate now.
+-        features.remove(ConsoleFeatures::VIRTIO_CONSOLE_F_MULTIPORT);
+-        features.bits()
++        (ConsoleFeatures::from_bits_truncate(features)
++            & (ConsoleFeatures::VIRTIO_CONSOLE_F_MULTIPORT
++                | ConsoleFeatures::VIRTIO_CONSOLE_F_SIZE))
++            .bits()
+     }
+ 
+-    pub(crate) fn init(mut device_transport: DeviceTransport) -> Result<(), VirtioDeviceError> {
+-        let config_manager = VirtioConsoleConfig::new_manager(device_transport.as_ref());
+-        debug!("virtio_console_config = {:?}", config_manager.read_config());
+-
+-        const RECV0_QUEUE_INDEX: u16 = 0;
+-        const TRANSMIT0_QUEUE_INDEX: u16 = 1;
+-        let receive_queue = SpinLock::new(VirtQueue::new(
+-            RECV0_QUEUE_INDEX,
+-            2,
+-            device_transport.as_mut(),
+-        )?);
+-        let transmit_queue = SpinLock::new(VirtQueue::new(
+-            TRANSMIT0_QUEUE_INDEX,
+-            2,
+-            device_transport.as_mut(),
+-        )?);
+-
+-        let send_buffer = DmaStream::alloc(1, false).map_err(VirtioDeviceError::ResourceAlloc)?;
+-        let receive_buffer =
+-            DmaStream::alloc(1, false).map_err(VirtioDeviceError::ResourceAlloc)?;
+-
++    pub(crate) fn init(mut transport: DeviceTransport) -> Result<(), VirtioDeviceError> {
++        let config = VirtioConsoleConfig::new_manager(transport.as_ref());
++        let features = ConsoleFeatures::from_bits_truncate(Self::negotiate_features(
++            transport.read_device_features(),
++        ));
++        let multiport = features.contains(ConsoleFeatures::VIRTIO_CONSOLE_F_MULTIPORT);
++        let count = if multiport {
++            config.read_config().max_nr_ports
++        } else {
++            1
++        };
++        // Bound queue indices and DMA allocations before trusting the device's limit.
++        if count == 0 || count > 32 {
++            return Err(VirtioDeviceError::UnsupportedConfig);
++        }
++        let device_index = DEVICES.lock().len();
++        let mut ports = Vec::new();
++        for id in 0..count {
++            ports.push(Arc::new(ConsolePort::new(
++                device_index,
++                id,
++                multiport,
++                transport.as_mut(),
++            )?));
++        }
++        let control = if multiport {
++            Some(SpinLock::new(ControlQueues::new(transport.as_mut())?))
++        } else {
++            None
++        };
+         let device = Arc::new(Self {
+-            config_manager,
+-            transport: SpinLock::new(device_transport),
+-            receive_queue,
+-            transmit_queue,
+-            send_buffer,
+-            receive_buffer,
+-            callbacks: Rcu::new(Box::new(Vec::new())),
++            config,
++            transport: SpinLock::new(transport),
++            ports,
++            control,
+         });
+-
+-        device.activate_receive_buffer(&mut device.receive_queue.disable_irq().lock());
+-
+-        // Register IRQ callbacks.
+         let mut transport = device.transport.lock();
+-        let handle_console_input = {
+-            // FIXME: This callback captures a strong `Arc`, creating a reference cycle.
+-            let device = device.clone();
+-            move |_: &TrapFrame| device.handle_recv_irq()
+-        };
+-        transport.register_queue_callback(
+-            RECV0_QUEUE_INDEX,
+-            Box::new(handle_console_input),
+-            false,
+-        )?;
+-        transport.register_cfg_callback(Box::new(config_space_change))?;
++        for port in &device.ports {
++            for index in [port.receive_index(), port.transmit_index()] {
++                let weak = Arc::downgrade(port);
++                transport.register_queue_callback(
++                    index,
++                    Box::new(move |_: &TrapFrame| {
++                        if let Some(port) = weak.upgrade() {
++                            port.notify();
++                        }
++                    }),
++                    false,
++                )?;
++            }
++        }
++        if multiport {
++            for index in [2, 3] {
++                let weak = Arc::downgrade(&device);
++                transport.register_queue_callback(
++                    index,
++                    Box::new(move |_: &TrapFrame| {
++                        if let Some(device) = weak.upgrade() {
++                            device.handle_control_irq();
++                        }
++                    }),
++                    false,
++                )?;
++            }
++        }
++        let weak = Arc::downgrade(&device);
++        transport.register_cfg_callback(Box::new(move |_: &TrapFrame| {
++            if let Some(device) = weak.upgrade() {
++                device.update_size();
++            }
++        }))?;
+         transport.finish_init();
+         drop(transport);
+-
+-        Self::notify_receive_queue(&mut device.receive_queue.disable_irq().lock());
+-
+-        aster_console::register_device(DEVICE_NAME.to_string(), device);
+-
++        DEVICES.lock().push(device.clone());
++        aster_console::register_device(DEVICE_NAME.to_string(), device.ports[0].clone());
++        device.update_size();
++        for port in &device.ports {
++            port.start_receive();
++        }
++        if let Some(control) = &device.control {
++            control
++                .lock()
++                .send(ControlMessage::new(0, event::DEVICE_READY, 1));
++        }
+         Ok(())
+     }
+ 
+-    fn handle_recv_irq(&self) {
+-        let mut receive_queue = self.receive_queue.disable_irq().lock();
++    fn update_size(&self) {
++        let config = self.config.read_config();
++        self.ports[0].resize(config.cols, config.rows);
++    }
+ 
+-        let Ok((_, len)) = receive_queue.pop_used() else {
++    fn handle_control_irq(&self) {
++        let Some(control) = &self.control else {
+             return;
+         };
+-        self.receive_buffer
+-            .sync_from_device(0..len as usize)
+-            .unwrap();
+-
+-        let callbacks = self.callbacks.read();
+-        for callback in callbacks.get().iter() {
+-            let mut reader = self.receive_buffer.reader().unwrap();
+-            reader.limit(len as usize);
+-            callback(reader);
++        // Release the control lock before callbacks or enqueueing responses.
++        let messages = control.lock().receive();
++        for (message, payload) in messages {
++            let Some(port) = self.ports.get(message.id as usize) else {
++                continue;
++            };
++            match message.event {
++                event::PORT_ADD => {
++                    port.add();
++                    control
++                        .lock()
++                        .send(ControlMessage::new(message.id, event::PORT_READY, 1));
++                }
++                event::PORT_REMOVE => port.remove(),
++                event::CONSOLE_PORT => {
++                    port.mark_console();
++                    self.open_port(port);
++                }
++                event::PORT_OPEN => {
++                    port.set_host_open(message.value == 1);
++                    if message.value == 1 {
++                        self.open_port(port);
++                    }
++                }
++                event::PORT_NAME => {
++                    if let Ok(name) = core::str::from_utf8(&payload) {
++                        port.set_name(name);
++                    }
++                }
++                event::RESIZE if payload.len() >= 4 => {
++                    port.resize(
++                        u16::from_le_bytes([payload[0], payload[1]]),
++                        u16::from_le_bytes([payload[2], payload[3]]),
++                    );
++                }
++                _ => {}
++            }
+         }
+-        drop(callbacks);
+-
+-        self.activate_receive_buffer(&mut receive_queue);
+-        Self::notify_receive_queue(&mut receive_queue);
++        control.lock().flush();
+     }
+ 
+-    fn activate_receive_buffer(&self, receive_queue: &mut VirtQueue) {
+-        receive_queue
+-            // We limit the buffer length to one to work around a QEMU bug that causes incorrect
+-            // results when pasting more than 32 bytes into the virtio console. This has no
+-            // performance penalty, since QEMU always gets one byte at a time, regardless of
+-            // whether we have this limit or not.
+-            //
+-            // For the QEMU bug, see details at
+-            // <https://lore.kernel.org/qemu-devel/20240707111940.232549-3-lrh2000@pku.edu.cn/T/#u>.
+-            .add_output_bufs(&[&Slice::new(&self.receive_buffer, 0..1)])
+-            .unwrap();
+-    }
+-
+-    fn notify_receive_queue(receive_queue: &mut VirtQueue) {
+-        if receive_queue.should_notify() {
+-            receive_queue.notify();
++    fn open_port(&self, port: &ConsolePort) {
++        // libkrun starts its I/O workers on the first PORT_OPEN. Avoid opening
++        // twice when CONSOLE_PORT is followed by the host's PORT_OPEN message.
++        if port.open_guest() {
++            self.control
++                .as_ref()
++                .unwrap()
++                .lock()
++                .send(ControlMessage::new(port.id(), event::PORT_OPEN, 1));
++            port.notify();
+         }
+     }
+ }
+-
+-fn config_space_change(_: &TrapFrame) {
+-    debug!("console device configuration space change");
+-}
+--- a/kernel/core/comps/virtio/src/device/console/mod.rs
++++ b/kernel/core/comps/virtio/src/device/console/mod.rs
+@@ -1,6 +1,8 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+ mod config;
++mod control;
+ pub mod device;
++pub mod port;
+ 
+ pub const DEVICE_NAME: &str = "Virtio-Console";
+--- /dev/null
++++ b/kernel/core/comps/virtio/src/device/console/control.rs
+@@ -0,0 +1,163 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Bounded, asynchronous control queues for virtio console port discovery.
++//!
++//! Wire format: Virtio 1.2, section 5.3.6.2.
++
++use alloc::{collections::VecDeque, vec::Vec};
++
++use aster_util::mem_obj_slice::Slice;
++use ostd::mm::{PAGE_SIZE, dma::DmaStream, io::util::HasVmReaderWriter};
++
++use crate::{device::VirtioDeviceError, queue::VirtQueue, transport::VirtioTransport};
++
++const RECEIVE_SLOTS: usize = 32;
++const CONTROL_BUFFER_SIZE: usize = 256;
++
++pub(super) mod event {
++    pub(crate) const DEVICE_READY: u16 = 0;
++    pub(crate) const PORT_ADD: u16 = 1;
++    pub(crate) const PORT_REMOVE: u16 = 2;
++    pub(crate) const PORT_READY: u16 = 3;
++    pub(crate) const CONSOLE_PORT: u16 = 4;
++    pub(crate) const RESIZE: u16 = 5;
++    pub(crate) const PORT_OPEN: u16 = 6;
++    pub(crate) const PORT_NAME: u16 = 7;
++}
++
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Pod)]
++pub(super) struct ControlMessage {
++    pub(super) id: u32,
++    pub(super) event: u16,
++    pub(super) value: u16,
++}
++
++impl ControlMessage {
++    pub(super) fn new(id: u32, event: u16, value: u16) -> Self {
++        Self {
++            id: id.to_le(),
++            event: event.to_le(),
++            value: value.to_le(),
++        }
++    }
++}
++
++pub(super) struct ControlQueues {
++    receive: VirtQueue,
++    transmit: VirtQueue,
++    receive_buffer: DmaStream,
++    receive_slots: [usize; RECEIVE_SLOTS],
++    transmit_buffer: DmaStream,
++    pending: VecDeque<ControlMessage>,
++    in_flight: bool,
++}
++
++impl ControlQueues {
++    pub(super) fn new(transport: &mut dyn VirtioTransport) -> Result<Self, VirtioDeviceError> {
++        let receive = VirtQueue::new(2, RECEIVE_SLOTS as u16, transport)?;
++        let transmit = VirtQueue::new(3, 2, transport)?;
++        let receive_buffer = DmaStream::alloc(
++            (RECEIVE_SLOTS * CONTROL_BUFFER_SIZE).div_ceil(PAGE_SIZE),
++            false,
++        )
++        .map_err(VirtioDeviceError::ResourceAlloc)?;
++        let transmit_buffer =
++            DmaStream::alloc(1, false).map_err(VirtioDeviceError::ResourceAlloc)?;
++        let mut queues = Self {
++            receive,
++            transmit,
++            receive_buffer,
++            receive_slots: [0; RECEIVE_SLOTS],
++            transmit_buffer,
++            pending: VecDeque::new(),
++            in_flight: false,
++        };
++        // Keep the control receive queue populated: libkrun coalesces control
++        // notifications and does not pump pending messages on receive kicks.
++        for slot in 0..RECEIVE_SLOTS {
++            queues.post_receive(slot);
++        }
++        queues.receive.notify();
++        Ok(queues)
++    }
++
++    pub(super) fn send(&mut self, message: ControlMessage) {
++        // At most 32 ports are supported. Keep malformed host event floods bounded.
++        if self.pending.len() < 128 {
++            self.pending.push_back(message);
++        }
++        self.flush();
++    }
++
++    pub(super) fn flush(&mut self) {
++        while self.transmit.pop_used_for_input().is_ok() {
++            self.in_flight = false;
++        }
++        if self.in_flight {
++            return;
++        }
++        let Some(message) = self.pending.pop_front() else {
++            return;
++        };
++        self.transmit_buffer
++            .writer()
++            .unwrap()
++            .write_val(&message)
++            .unwrap();
++        self.transmit_buffer
++            .sync_to_device(0..size_of::<ControlMessage>())
++            .unwrap();
++        self.transmit
++            .add_input_bufs(&[&Slice::new(
++                &self.transmit_buffer,
++                0..size_of::<ControlMessage>(),
++            )])
++            .unwrap();
++        self.in_flight = true;
++        self.transmit.notify();
++    }
++
++    pub(super) fn receive(&mut self) -> Vec<(ControlMessage, Vec<u8>)> {
++        let mut messages = Vec::new();
++        let mut replenished = false;
++        while let Ok((token, len)) = self.receive.pop_used() {
++            replenished = true;
++            let slot = self.receive_slots[token as usize];
++            let offset = slot * CONTROL_BUFFER_SIZE;
++            let len = (len as usize).min(CONTROL_BUFFER_SIZE);
++            self.receive_buffer
++                .sync_from_device(offset..offset + len)
++                .unwrap();
++            if len >= size_of::<ControlMessage>() {
++                let mut reader = self.receive_buffer.reader().unwrap();
++                reader.skip(offset);
++                reader.limit(len);
++                let mut message: ControlMessage = reader.read_val().unwrap();
++                message.id = u32::from_le(message.id);
++                message.event = u16::from_le(message.event);
++                message.value = u16::from_le(message.value);
++                let mut payload = alloc::vec![0; reader.remain()];
++                reader.read(&mut payload.as_mut_slice().into());
++                messages.push((message, payload));
++            }
++            self.post_receive(slot);
++        }
++        if replenished {
++            self.receive.notify();
++        }
++        messages
++    }
++
++    fn post_receive(&mut self, slot: usize) {
++        let offset = slot * CONTROL_BUFFER_SIZE;
++        let token = self
++            .receive
++            .add_output_bufs(&[&Slice::new(
++                &self.receive_buffer,
++                offset..offset + CONTROL_BUFFER_SIZE,
++            )])
++            .unwrap();
++        self.receive_slots[token as usize] = slot;
++    }
++}
+--- /dev/null
++++ b/kernel/core/comps/virtio/src/device/console/port.rs
+@@ -0,0 +1,346 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Independent console ports with bounded receive and transmit buffers.
++
++use alloc::{
++    boxed::Box,
++    collections::VecDeque,
++    fmt,
++    string::{String, ToString},
++    sync::Arc,
++    vec::Vec,
++};
++
++use aster_console::{AnyConsoleDevice, ConsoleCallback};
++use aster_util::mem_obj_slice::Slice;
++use ostd::{
++    mm::{PAGE_SIZE, VmReader, dma::DmaStream, io::util::HasVmReaderWriter},
++    sync::{LocalIrqDisabled, Rcu, SpinLock},
++};
++
++use crate::{device::VirtioDeviceError, queue::VirtQueue, transport::VirtioTransport};
++
++const TX_SLOTS: usize = 16;
++const TX_CHUNK: usize = PAGE_SIZE / TX_SLOTS;
++
++pub type PortCallback = dyn Fn() + Send + Sync;
++
++#[derive(Clone, Debug, Default)]
++pub struct PortInfo {
++    pub name: String,
++    pub present: bool,
++    pub is_console: bool,
++    pub host_open: Option<bool>,
++    pub guest_open: bool,
++    pub cols: u16,
++    pub rows: u16,
++}
++
++pub struct ConsolePort {
++    device_index: usize,
++    id: u32,
++    info: SpinLock<PortInfo, LocalIrqDisabled>,
++    receive: SpinLock<ReceiveQueue, LocalIrqDisabled>,
++    transmit: SpinLock<TransmitQueue, LocalIrqDisabled>,
++    callbacks: Rcu<Box<Vec<Arc<PortCallback>>>>,
++    legacy_callbacks: Rcu<Box<Vec<&'static ConsoleCallback>>>,
++}
++
++struct ReceiveQueue {
++    queue: VirtQueue,
++    buffer: DmaStream,
++    ready: core::ops::Range<usize>,
++    posted: bool,
++    capacity: usize,
++}
++
++struct TransmitQueue {
++    queue: VirtQueue,
++    buffer: DmaStream,
++    free: VecDeque<usize>,
++    in_flight: [Option<usize>; TX_SLOTS],
++}
++
++impl ConsolePort {
++    pub const MAX_WRITE_SIZE: usize = TX_CHUNK;
++
++    pub(super) fn new(
++        device_index: usize,
++        id: u32,
++        multiport: bool,
++        transport: &mut dyn VirtioTransport,
++    ) -> Result<Self, VirtioDeviceError> {
++        let receive_index = if id == 0 { 0 } else { 2 + 2 * id as u16 };
++        let receive = ReceiveQueue {
++            queue: VirtQueue::new(receive_index, 2, transport)?,
++            buffer: DmaStream::alloc(1, false).map_err(VirtioDeviceError::ResourceAlloc)?,
++            ready: 0..0,
++            posted: false,
++            // Retain the upstream QEMU console workaround; raw ports use full pages.
++            capacity: if id == 0 { 1 } else { PAGE_SIZE },
++        };
++        let transmit = TransmitQueue {
++            queue: VirtQueue::new(receive_index + 1, TX_SLOTS as u16, transport)?,
++            buffer: DmaStream::alloc(1, false).map_err(VirtioDeviceError::ResourceAlloc)?,
++            free: (0..TX_SLOTS).collect(),
++            in_flight: [None; TX_SLOTS],
++        };
++        let info = PortInfo {
++            present: !multiport,
++            is_console: !multiport,
++            host_open: if multiport { None } else { Some(true) },
++            guest_open: !multiport,
++            ..PortInfo::default()
++        };
++        Ok(Self {
++            device_index,
++            id,
++            info: SpinLock::new(info),
++            receive: SpinLock::new(receive),
++            transmit: SpinLock::new(transmit),
++            callbacks: Rcu::new(Box::new(Vec::new())),
++            legacy_callbacks: Rcu::new(Box::new(Vec::new())),
++        })
++    }
++
++    pub fn device_index(&self) -> usize {
++        self.device_index
++    }
++    pub fn id(&self) -> u32 {
++        self.id
++    }
++    pub fn info(&self) -> PortInfo {
++        self.info.lock().clone()
++    }
++    pub(super) fn receive_index(&self) -> u16 {
++        if self.id == 0 {
++            0
++        } else {
++            2 + 2 * self.id as u16
++        }
++    }
++    pub(super) fn transmit_index(&self) -> u16 {
++        self.receive_index() + 1
++    }
++
++    pub fn register_notifier(&self, callback: Arc<PortCallback>) {
++        loop {
++            let current = self.callbacks.read();
++            let mut next = current.get().clone();
++            next.push(callback.clone());
++            if current.compare_exchange(next).is_ok() {
++                break;
++            }
++        }
++    }
++
++    pub fn notify(&self) {
++        let callbacks = self.callbacks.read();
++        for callback in callbacks.get().iter() {
++            callback();
++        }
++        let legacy = self.legacy_callbacks.read();
++        if !legacy.get().is_empty() {
++            let mut bytes = [0u8; 1];
++            while self.try_read(&mut bytes) == Some(1) {
++                for callback in legacy.get().iter() {
++                    callback(VmReader::from(bytes.as_slice()));
++                }
++            }
++        }
++    }
++
++    pub fn can_read(&self) -> bool {
++        self.receive.lock().has_data()
++    }
++
++    /// Attempts a raw read; an empty successful read means host EOF.
++    pub fn try_read(&self, output: &mut [u8]) -> Option<usize> {
++        if output.is_empty() {
++            return Some(0);
++        }
++        let mut receive = self.receive.lock();
++        if receive.has_data() {
++            let mut reader = receive.buffer.reader().unwrap();
++            reader.skip(receive.ready.start);
++            reader.limit(receive.ready.len());
++            let count = reader.read(&mut output.into());
++            receive.ready.start += count;
++            if receive.ready.is_empty() {
++                receive.post();
++            }
++            return Some(count);
++        }
++        drop(receive);
++        if self.info.lock().host_open == Some(false) {
++            Some(0)
++        } else {
++            None
++        }
++    }
++
++    pub fn can_write(&self) -> bool {
++        let info = self.info.lock();
++        if !info.guest_open || info.host_open == Some(false) {
++            return false;
++        }
++        drop(info);
++        let mut transmit = self.transmit.lock();
++        transmit.reclaim();
++        !transmit.free.is_empty()
++    }
++
++    /// Reserves descriptors for the line discipline's short echo sequences.
++    pub fn can_echo(&self) -> bool {
++        let mut transmit = self.transmit.lock();
++        transmit.reclaim();
++        transmit.free.len() >= 4
++    }
++
++    pub fn try_write(&self, input: &[u8]) -> Option<usize> {
++        if input.is_empty() {
++            return Some(0);
++        }
++        let info = self.info.lock();
++        if !info.guest_open || info.host_open == Some(false) {
++            return None;
++        }
++        drop(info);
++        let mut transmit = self.transmit.lock();
++        transmit.reclaim();
++        let slot = transmit.free.pop_front()?;
++        let count = input.len().min(TX_CHUNK);
++        let offset = slot * TX_CHUNK;
++        let TransmitQueue { buffer, queue, .. } = &mut *transmit;
++        let mut writer = buffer.writer().unwrap();
++        writer.skip(offset);
++        writer.write(&mut VmReader::from(&input[..count]));
++        buffer.sync_to_device(offset..offset + count).unwrap();
++        let token = queue
++            .add_input_bufs(&[&Slice::new(&*buffer, offset..offset + count)])
++            .unwrap();
++        transmit.in_flight[token as usize] = Some(slot);
++        transmit.queue.notify();
++        Some(count)
++    }
++
++    pub(super) fn start_receive(&self) {
++        self.receive.lock().post();
++    }
++    pub(super) fn add(&self) {
++        self.info.lock().present = true;
++        self.notify();
++    }
++    pub(super) fn remove(&self) {
++        let mut info = self.info.lock();
++        info.present = false;
++        info.host_open = Some(false);
++        info.guest_open = false;
++        drop(info);
++        self.notify();
++    }
++    pub(super) fn mark_console(&self) {
++        self.info.lock().is_console = true;
++        self.notify();
++    }
++    pub(super) fn set_host_open(&self, open: bool) {
++        self.info.lock().host_open = Some(open);
++        self.notify();
++    }
++    pub(super) fn set_name(&self, name: &str) {
++        if name.len() < 128 {
++            self.info.lock().name = name.to_string();
++        }
++        self.notify();
++    }
++    pub(super) fn open_guest(&self) -> bool {
++        let mut info = self.info.lock();
++        if info.guest_open {
++            return false;
++        }
++        info.guest_open = true;
++        true
++    }
++    pub(super) fn resize(&self, cols: u16, rows: u16) {
++        let mut info = self.info.lock();
++        info.cols = cols;
++        info.rows = rows;
++        drop(info);
++        self.notify();
++    }
++}
++
++impl ReceiveQueue {
++    fn post(&mut self) {
++        if self.posted {
++            return;
++        }
++        self.queue
++            .add_output_bufs(&[&Slice::new(&self.buffer, 0..self.capacity)])
++            .unwrap();
++        self.posted = true;
++        self.queue.notify();
++    }
++    fn has_data(&mut self) -> bool {
++        if !self.ready.is_empty() {
++            return true;
++        }
++        if let Ok((_, len)) = self.queue.pop_used() {
++            let len = (len as usize).min(self.capacity);
++            self.buffer.sync_from_device(0..len).unwrap();
++            self.ready = 0..len;
++            self.posted = false;
++            if len == 0 {
++                self.post();
++            }
++        }
++        !self.ready.is_empty()
++    }
++}
++
++impl TransmitQueue {
++    fn reclaim(&mut self) {
++        while let Ok(token) = self.queue.pop_used_for_input() {
++            if let Some(slot) = self.in_flight[token as usize].take() {
++                self.free.push_back(slot);
++            }
++        }
++    }
++}
++
++impl fmt::Debug for ConsolePort {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("ConsolePort")
++            .field("id", &self.id)
++            .finish_non_exhaustive()
++    }
++}
++
++impl AnyConsoleDevice for ConsolePort {
++    fn send(&self, mut input: &[u8]) {
++        // Logging can run with interrupts disabled. Never wait for the host
++        // here; user-space writes sleep in the TTY/raw-device layer instead.
++        while !input.is_empty() {
++            let info = self.info.lock();
++            if !info.guest_open || info.host_open == Some(false) {
++                return;
++            }
++            drop(info);
++            if let Some(count) = self.try_write(input) {
++                input = &input[count..];
++            } else {
++                return;
++            }
++        }
++    }
++    fn register_callback(&self, callback: &'static ConsoleCallback) {
++        loop {
++            let current = self.legacy_callbacks.read();
++            let mut next = current.get().clone();
++            next.push(callback);
++            if current.compare_exchange(next).is_ok() {
++                break;
++            }
++        }
++    }
++}
+--- a/kernel/core/comps/virtio/src/queue.rs
++++ b/kernel/core/comps/virtio/src/queue.rs
+@@ -78,6 +78,11 @@
+ #[derive(Debug)]
+ pub(crate) enum PopUsedError {
+     NotReady,
++}
++
++enum UsedLengthCheck {
++    Required,
++    IgnoreForInput,
+ }
+ 
+ #[derive(Debug)]
+@@ -403,6 +408,17 @@
+         self.pop_used_with_min_bytes(0)
+     }
+ 
++    /// Pops a device-readable-only buffer, ignoring its reported used length.
++    ///
++    /// Some virtio-console implementations (including libkrun) report bytes
++    /// consumed instead of bytes written on transmit queues. Only chains with
++    /// no device-writable buffers get this compatibility treatment. Descriptor
++    /// tokens retain the same validation as `pop_used`.
++    pub(crate) fn pop_used_for_input(&mut self) -> Result<u16, PopUsedError> {
++        self.do_pop_used(0, UsedLengthCheck::IgnoreForInput)
++            .map(|(token, _)| token)
++    }
++
+     /// Pops a device-used buffer, which is expected to contain at least `min_bytes` bytes, and
+     /// returns the token and the buffer length.
+     ///
+@@ -414,6 +430,14 @@
+     pub(crate) fn pop_used_with_min_bytes(
+         &mut self,
+         min_bytes: usize,
++    ) -> Result<(u16, u32), PopUsedError> {
++        self.do_pop_used(min_bytes, UsedLengthCheck::Required)
++    }
++
++    fn do_pop_used(
++        &mut self,
++        min_bytes: usize,
++        length_check: UsedLengthCheck,
+     ) -> Result<(u16, u32), PopUsedError> {
+         loop {
+             if !self.can_pop() {
+@@ -427,7 +451,7 @@
+                 ptr.cast::<UsedElem>()
+             };
+             let index = field_ptr!(&element_ptr, UsedElem, id).read_once().unwrap();
+-            let len = field_ptr!(&element_ptr, UsedElem, len).read_once().unwrap();
++            let mut len = field_ptr!(&element_ptr, UsedElem, len).read_once().unwrap();
+             self.last_used_idx = self.last_used_idx.wrapping_add(1);
+ 
+             let (desc, dma_len) = if let Some(desc) = self.descs.get_mut(index as usize)
+@@ -442,6 +466,9 @@
+                 );
+                 continue;
+             };
++            if matches!(length_check, UsedLengthCheck::IgnoreForInput) && dma_len == 0 {
++                len = 0;
++            }
+             if len > dma_len || (len as usize) < min_bytes {
+                 ostd::error!(
+                     "invalid used length: {} (expected {}..={})",
+--- a/kernel/core/src/device/mod.rs
++++ b/kernel/core/src/device/mod.rs
+@@ -6,6 +6,7 @@
+ pub(crate) mod misc;
+ mod model;
+ mod pty;
++mod virtio_port;
+ pub mod registry;
+ pub(crate) mod tty;
+ 
+@@ -65,6 +66,7 @@
+ 
+ /// Initializes device state after mounting rootfs.
+ pub(crate) fn init_in_first_process() -> Result<()> {
++    virtio_port::init_in_first_process()?;
+     tty::init_in_first_process()?;
+     registry::init_in_first_process()?;
+ 
+--- /dev/null
++++ b/kernel/core/src/device/virtio_port.rs
+@@ -0,0 +1,183 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Raw virtio serial ports, independent of the console's terminal processing.
++
++use aster_virtio::device::console::{device, port::ConsolePort};
++use device_id::{DeviceId, MinorId};
++
++use crate::{
++    device::{Device, DeviceType, registry::char},
++    events::IoEvents,
++    fs::{
++        devtmpfs::DevtmpfsNodeMeta,
++        file::{PerOpenFileOps, StatusFlags},
++        vfs::{inode::FileOps, path::Path},
++    },
++    prelude::*,
++    process::signal::{PollHandle, Pollable, Pollee},
++    util::ioctl::{OutData, RawIoctl},
++};
++
++// Bootstrap discovery until virtio-ports sysfs/udev integration is available.
++// Private PoC ABI: _IOR('V', 0, char[128]), a NUL-terminated port name.
++type GetPortName = crate::ioc!(VPORT_GET_NAME, b'V', 0, OutData<[u8; 128]>);
++
++struct PortState {
++    port: Arc<ConsolePort>,
++    pollee: Pollee,
++}
++
++struct PortDevice {
++    id: DeviceId,
++    state: Arc<PortState>,
++    _major: Arc<char::MajorIdOwner>,
++}
++
++impl Device for PortDevice {
++    fn type_(&self) -> DeviceType {
++        DeviceType::Char
++    }
++    fn id(&self) -> DeviceId {
++        self.id
++    }
++    fn devtmpfs_meta(&self) -> Option<DevtmpfsNodeMeta> {
++        Some(
++            DevtmpfsNodeMeta::new(alloc::format!(
++                "vport{}p{}",
++                self.state.port.device_index(),
++                self.state.port.id()
++            ))
++            .unwrap(),
++        )
++    }
++    fn open(&self) -> Result<Box<dyn PerOpenFileOps>> {
++        Ok(Box::new(PortFile {
++            state: self.state.clone(),
++        }))
++    }
++}
++
++struct PortFile {
++    state: Arc<PortState>,
++}
++
++impl Pollable for PortFile {
++    fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
++        self.state.pollee.poll_with(mask, poller, || {
++            let mut events = IoEvents::empty();
++            if self.state.port.can_read() {
++                events |= IoEvents::IN;
++            }
++            if self.state.port.can_write() {
++                events |= IoEvents::OUT;
++            }
++            if self.state.port.info().host_open == Some(false) {
++                events |= IoEvents::IN | IoEvents::HUP;
++            }
++            events
++        })
++    }
++}
++
++impl FileOps for PortFile {
++    fn read_at(&self, _offset: usize, writer: &mut VmWriter, flags: StatusFlags) -> Result<usize> {
++        if writer.avail() == 0 {
++            return Ok(0);
++        }
++        let mut bytes = vec![0; writer.avail().min(PAGE_SIZE)];
++        let mut read = || {
++            self.state
++                .port
++                .try_read(&mut bytes)
++                .ok_or_else(|| Error::with_message(Errno::EAGAIN, "no port data is available"))
++        };
++        let count = if flags.contains(StatusFlags::O_NONBLOCK) {
++            read()?
++        } else {
++            self.wait_events(IoEvents::IN, None, read)?
++        };
++        self.state.pollee.invalidate();
++        writer.write_fallible(&mut bytes[..count].into())?;
++        Ok(count)
++    }
++
++    fn write_at(&self, _offset: usize, reader: &mut VmReader, flags: StatusFlags) -> Result<usize> {
++        if reader.remain() == 0 {
++            return Ok(0);
++        }
++        let mut bytes = vec![0; reader.remain().min(ConsolePort::MAX_WRITE_SIZE)];
++        let len = reader.read_fallible(&mut bytes.as_mut_slice().into())?;
++        let write = || {
++            if self.state.port.info().host_open == Some(false) {
++                return_errno_with_message!(Errno::EPIPE, "the host port is closed");
++            }
++            self.state
++                .port
++                .try_write(&bytes[..len])
++                .ok_or_else(|| Error::with_message(Errno::EAGAIN, "the port output queue is full"))
++        };
++        let count = if flags.contains(StatusFlags::O_NONBLOCK) {
++            write()?
++        } else {
++            self.wait_events(IoEvents::OUT, None, write)?
++        };
++        self.state.pollee.invalidate();
++        Ok(count)
++    }
++}
++
++impl PerOpenFileOps for PortFile {
++    fn check_seekable(&self) -> Result<()> {
++        return_errno_with_message!(Errno::ESPIPE, "the port is not seekable");
++    }
++    fn is_offset_aware(&self) -> bool {
++        false
++    }
++    fn ioctl(&self, _path: &Path, raw_ioctl: RawIoctl) -> Result<i32> {
++        crate::dispatch_ioctl!(match raw_ioctl {
++            cmd @ GetPortName => {
++                let info = self.state.port.info();
++                if info.is_console {
++                    return_errno_with_message!(Errno::ENODATA, "the port is a console");
++                }
++                if !info.present || info.name.is_empty() {
++                    return_errno_with_message!(Errno::EAGAIN, "the port name is not available");
++                }
++                let mut name = [0; 128];
++                name[..info.name.len()].copy_from_slice(info.name.as_bytes());
++                cmd.write(&name)?;
++            }
++            _ => return_errno_with_message!(Errno::ENOTTY, "the port ioctl is not supported"),
++        });
++        Ok(0)
++    }
++}
++
++pub(super) fn init_in_first_process() -> Result<()> {
++    let ports = device::ports();
++    if ports.is_empty() {
++        return Ok(());
++    }
++    // The registry and open files hold the devices for the kernel's lifetime.
++    let major = Arc::new(char::allocate_major()?);
++    for (index, port) in ports.into_iter().enumerate() {
++        let state = Arc::new(PortState {
++            port,
++            pollee: Pollee::new(),
++        });
++        let weak = Arc::downgrade(&state);
++        state.port.register_notifier(Arc::new(move || {
++            if let Some(state) = weak.upgrade() {
++                state
++                    .pollee
++                    .notify(IoEvents::IN | IoEvents::OUT | IoEvents::HUP);
++            }
++        }));
++        char::register(Arc::new(PortDevice {
++            id: DeviceId::new(major.get(), MinorId::new(index as u32)),
++            state,
++            _major: major.clone(),
++        }))?;
++    }
++    Ok(())
++}
+--- a/kernel/core/src/device/tty/hvc.rs
++++ b/kernel/core/src/device/tty/hvc.rs
+@@ -2,92 +2,115 @@
+ 
+ use alloc::format;
+ 
+-use aster_console::AnyConsoleDevice;
+-use ostd::mm::Infallible;
++use aster_virtio::device::console::{device, port::ConsolePort};
++use ostd::sync::LocalIrqDisabled;
+ use spin::Once;
+ 
+ use super::{Tty, TtyDriver};
+ use crate::{
+     device::{
+         registry::char,
+-        tty::{file::TtyFile, termio::CTermios},
++        tty::{
++            file::TtyFile,
++            termio::{CTermios, CWinSize},
++        },
+     },
+     fs::{devtmpfs::DevtmpfsNodeMeta, file::PerOpenFileOps},
+     prelude::*,
++    process::{broadcast_signal_async, signal::constants::SIGWINCH},
+ };
+ 
+ /// The driver for hypervisor console devices.
+-#[derive(Clone)]
+ pub(super) struct HvcDriver {
+-    console: Arc<dyn AnyConsoleDevice>,
++    console: Arc<ConsolePort>,
++    event_lock: SpinLock<(), LocalIrqDisabled>,
+ }
+ 
+ impl TtyDriver for HvcDriver {
+-    // Reference: <https://elixir.bootlin.com/linux/v6.17/source/Documentation/admin-guide/devices.txt#L2936>.
+     const DEVICE_MAJOR_ID: u32 = 229;
+-
+     fn devtmpfs_meta(&self, index: u32) -> Option<DevtmpfsNodeMeta> {
+         Some(DevtmpfsNodeMeta::new(format!("hvc{}", index)).unwrap())
+     }
+-
+     fn open(tty: Arc<Tty<Self>>) -> Result<Box<dyn PerOpenFileOps>> {
+         Ok(Box::new(TtyFile::new(tty)))
+     }
+-
+     fn push_output(&self, chs: &[u8]) -> Result<usize> {
+-        self.console.send(chs);
+-        Ok(chs.len())
++        self.console
++            .try_write(chs)
++            .ok_or_else(|| Error::with_message(Errno::EAGAIN, "the console output queue is full"))
+     }
+-
+     fn echo_callback(&self) -> impl FnMut(&[u8]) + '_ {
+-        |chs| self.console.send(chs)
++        |chs| {
++            self.console.try_write(chs);
++        }
+     }
+-
+     fn can_push(&self) -> bool {
+-        true
++        self.console.can_write()
+     }
+-
+-    fn notify_input(&self) {}
+-
+-    fn on_termios_change(&self, _old_termios: &CTermios, _new_termios: &CTermios) {}
++    fn notify_input(&self) {
++        self.console.notify();
++    }
++    fn on_termios_change(&self, _old: &CTermios, _new: &CTermios) {}
+ }
+ 
+ static HVC0: Once<Arc<Tty<HvcDriver>>> = Once::new();
+ 
+-/// Returns the `hvc0` device.
+-///
+-/// Returns `None` if the device is not found nor initialized.
++/// Returns the first hypervisor console, if present.
+ pub(super) fn hvc0_device() -> Option<&'static Arc<Tty<HvcDriver>>> {
+     HVC0.get()
+ }
+ 
+ pub(super) fn init_in_first_process() -> Result<()> {
+-    let devices = aster_console::all_devices();
+-
+-    // Initialize the `hvc0` device if the virtio console is available.
+-
+-    let virtio_console = devices
+-        .iter()
+-        .find(|(name, _)| name.as_str() == aster_virtio::device::console::DEVICE_NAME)
+-        .map(|(_, device)| device.clone());
+-
+-    if let Some(virtio_console) = virtio_console {
+-        let driver = HvcDriver {
+-            console: virtio_console.clone(),
+-        };
+-        let hvc0 = Tty::new(0, driver);
+-
+-        HVC0.call_once(|| hvc0.clone());
+-        char::register(hvc0.clone())?;
+-
+-        virtio_console.register_callback(Box::leak(Box::new(
+-            move |mut reader: VmReader<Infallible>| {
+-                let mut chs = vec![0u8; reader.remain()];
+-                reader.read(&mut VmWriter::from(chs.as_mut_slice()));
+-                let _ = hvc0.push_input(chs.as_slice());
+-            },
+-        )));
+-    }
+-
++    let Some(console) = device::ports().into_iter().find(|port| port.id() == 0) else {
++        return Ok(());
++    };
++    let hvc = Tty::new(
++        0,
++        HvcDriver {
++            console: console.clone(),
++            event_lock: SpinLock::new(()),
++        },
++    );
++    HVC0.call_once(|| hvc.clone());
++    char::register(hvc.clone())?;
++    let weak = Arc::downgrade(&hvc);
++    console.register_notifier(Arc::new(move || {
++        if let Some(hvc) = weak.upgrade() {
++            on_event(&hvc);
++        }
++    }));
++    on_event(&hvc);
+     Ok(())
+ }
++
++fn on_event(hvc: &Tty<HvcDriver>) {
++    // Initial delivery also runs in process context. Keep a received byte and
++    // its line-discipline insertion atomic with respect to later RX interrupts.
++    let _event_guard = hvc.driver().event_lock.lock();
++    let port = &hvc.driver().console;
++    let info = port.info();
++    let size = CWinSize::new(info.cols, info.rows);
++    let changed = {
++        let mut ldisc = hvc.ldisc.lock();
++        let changed = ldisc.window_size() != size;
++        if changed {
++            ldisc.set_window_size(size);
++        }
++        changed
++    };
++    if changed && let Some(group) = hvc.job_control.foreground() {
++        broadcast_signal_async(Arc::downgrade(&group), SIGWINCH);
++    }
++    while hvc.can_push() && port.can_echo() {
++        let mut byte = [0];
++        if port.try_read(&mut byte) != Some(1) {
++            break;
++        }
++        let _ = hvc.push_input(&byte);
++    }
++    hvc.notify_output();
++    if info.host_open == Some(false) {
++        hvc.tty_flags().set_other_closed();
++        hvc.notify_hup();
++    }
++}
+--- a/kernel/core/src/device/tty/termio.rs
++++ b/kernel/core/src/device/tty/termio.rs
+@@ -445,12 +445,23 @@
+ ///
+ /// Reference: <https://elixir.bootlin.com/linux/v6.0.9/source/include/uapi/asm-generic/termios.h#L15>.
+ #[repr(C)]
+-#[derive(Clone, Copy, Debug, Default, Pod)]
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod)]
+ pub(crate) struct CWinSize {
+     ws_row: u16,
+     ws_col: u16,
+     ws_xpixel: u16,
+     ws_ypixel: u16,
++}
++
++impl CWinSize {
++    pub(super) fn new(cols: u16, rows: u16) -> Self {
++        Self {
++            ws_col: cols,
++            ws_row: rows,
++            ws_xpixel: 0,
++            ws_ypixel: 0,
++        }
++    }
+ }
+ 
+ /// A font operation; `struct console_font_op` in Linux.
+--- a/kernel/core/src/device/registry/char.rs
++++ b/kernel/core/src/device/registry/char.rs
+@@ -89,7 +89,6 @@
+ ///
+ /// The returned `MajorIdOwner` object represents the ownership to the major ID.
+ /// Until the object is dropped, this major ID cannot be acquired via `acquire_major` or `allocate_major` again.
+-#[expect(dead_code)]
+ pub(crate) fn allocate_major() -> Result<MajorIdOwner> {
+     let mut majors = MAJORS.lock();
+ 

@@ -51,6 +51,55 @@ static struct json_object *field(struct json_object *object, const char *name)
     return value;
 }
 
+/* Private bootstrap ABI until Asterinas exports virtio port names in sysfs. */
+#define VPORT_GET_NAME _IOR('V', 0, char[128])
+
+static void setup_stdio(void)
+{
+    int console = open("/dev/hvc0", O_RDWR | O_NOCTTY);
+    if (console >= 0) {
+        if (setsid() < 0 && errno != EPERM) fail("setsid");
+        if (ioctl(console, TIOCSCTTY, 0)) fail("set controlling console");
+        for (int stream = 0; stream < 3; ++stream)
+            if (dup2(console, stream) < 0) fail("attach console");
+        close(console);
+        directory("/dev/virtio-ports");
+        /* Names arrive asynchronously after DEVICE_READY / PORT_READY.
+         * Probe every advertised device, without assuming fixed port numbers. */
+        for (unsigned attempt = 0; attempt < 200; ++attempt) {
+            int pending = 0;
+            for (unsigned port = 0; port < 32; ++port) {
+                char path[64], name[128] = {0};
+                snprintf(path, sizeof(path), "/dev/vport0p%u", port);
+                int fd = open(path, O_RDWR | O_NONBLOCK | O_NOCTTY);
+                if (fd < 0) continue;
+                if (ioctl(fd, VPORT_GET_NAME, name)) {
+                    if (errno == EAGAIN) pending = 1;
+                    close(fd);
+                    continue;
+                }
+                int stream = !strcmp(name, "krun-stdin") ? 0 :
+                    !strcmp(name, "krun-stdout") ? 1 : !strcmp(name, "krun-stderr") ? 2 : -1;
+                if (stream >= 0) {
+                    char alias[192];
+                    snprintf(alias, sizeof(alias), "/dev/virtio-ports/%s", name);
+                    if (symlink(path, alias) && errno != EEXIST) fail("name virtio port");
+                    if (fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK) || dup2(fd, stream) < 0)
+                        fail("attach virtio port");
+                }
+                close(fd);
+            }
+            if (!pending) break;
+            usleep(10000);
+        }
+    } else if (access("/dev/ttyS0", F_OK)) {
+        int log = open("/.asterinas.log", O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+        if (log < 0) fail("open guest log");
+        if (dup2(log, STDOUT_FILENO) < 0 || dup2(log, STDERR_FILENO) < 0) fail("redirect guest log");
+        close(log);
+    }
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -69,14 +118,7 @@ int main(void)
     };
     for (size_t i = 0; i < sizeof(links) / sizeof(links[0]); ++i)
         if (symlink(links[i][0], links[i][1]) && errno != EEXIST) fail(links[i][1]);
-    /* Stock krun exposes only a multiport console. The headless PoC writes
-     * diagnostics into the container's writable layer instead. */
-    if (access("/dev/ttyS0", F_OK)) {
-        int log = open("/.asterinas.log", O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
-        if (log < 0) fail("open guest log");
-        if (dup2(log, STDOUT_FILENO) < 0 || dup2(log, STDERR_FILENO) < 0) fail("redirect guest log");
-        close(log);
-    }
+    setup_stdio();
     puts("Asterinas libkrunfw bootstrap");
     int network = socket(AF_INET, SOCK_DGRAM, 0);
     struct ifreq iface = { .ifr_name = "eth0" };

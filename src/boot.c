@@ -58,22 +58,21 @@ void boot_prepare(unsigned char *params)
     if (limit > 4096) limit = 4096;
     const char *end = input;
     while ((size_t)(end - input) < limit && *end) ++end;
-    int headless = 0;
+    int virtio_console = 0, serial_console = 0;
     for (const char *s = input; s < end;) {
         while (s < end && *s == ' ') ++s;
         const char *token = s;
         while (s < end && *s != ' ') ++s;
-        if (is_console(token, s)) headless = 1;
+        if (is_console(token, s)) virtio_console = 1;
+        if (starts(token, s, "console=ttyS0")) serial_console = 1;
     }
     char *output = (char *)CMDLINE_ADDR;
-    const char *prefix = headless ? "loglevel=error console=tty0 " : "earlycon loglevel=error ";
+    const char *prefix = virtio_console && !serial_console ? "loglevel=error console=hvc0 " : "earlycon loglevel=error ";
     while (*prefix) *output++ = *prefix++;
     for (const char *s = input; s < end;) {
         const char *token = s;
         while (s < end && *s != ' ') ++s;
-        /* Asterinas's single-port driver cannot negotiate libkrun's multiport
-         * console. Leave it unbound for the headless stock-krun path. */
-        if (!is_console(token, s)) while (token < s) *output++ = *token++;
+        while (token < s) *output++ = *token++;
         if (s < end) *output++ = *s++;
     }
     *output = 0;

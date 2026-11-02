@@ -13,8 +13,7 @@ test -f "$rpm"
 mkdir -p build
 collect_guest_log() {
     "$engine" exec "$test_container" bash -c '
-        rootfs=$(podman --cgroup-manager=cgroupfs --storage-driver=vfs mount nginx-asterinas)
-        cat "$rootfs/.asterinas.log"
+        podman --cgroup-manager=cgroupfs --storage-driver=vfs logs nginx-asterinas
     ' >build/nginx-guest.log 2>/dev/null || true
 }
 cleanup() {
@@ -46,6 +45,7 @@ podman --cgroup-manager=cgroupfs --storage-driver=vfs network create \
 # --cgroupns=host also makes the nested test's cgroup mount consistent.
 podman --cgroup-manager=cgroupfs --storage-driver=vfs run -d \
     --name nginx-asterinas --runtime /usr/bin/krun \
+    --log-driver=k8s-file \
     --security-opt seccomp=unconfined --pid host --cgroupns host \
     --annotation krun.cpus=1 --annotation krun.use_passt=1 \
     --network asterinas --ip 10.0.2.15 -p 18080:8080 \

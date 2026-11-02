@@ -9,7 +9,7 @@ all: $(BUILD)/libkrunfw.so.5 $(BUILD)/run
 kernel:
 	bash tools/build-kernel.sh
 
-$(BUILD)/asterinas.elf: upstream.json tools/build-kernel.sh tools/fetch-sources.py
+$(BUILD)/asterinas.elf: upstream.json tools/build-kernel.sh tools/fetch-sources.py $(wildcard patches/*)
 	bash tools/build-kernel.sh
 
 $(BUILD)/init: src/init.c
