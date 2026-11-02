@@ -124,8 +124,8 @@ def initramfs(init_path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("kernel", type=Path)
-    parser.add_argument("init", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--init", type=Path, help="include a bootstrap initramfs; omit for direct root boot")
     args = parser.parse_args()
     base, entry, image = flatten_elf(args.kernel.read_bytes())
     args.output.mkdir(parents=True, exist_ok=True)
@@ -134,12 +134,12 @@ def main():
     cmdline_offset = acpi_offset + 4096
     mmio_pd_offset = cmdline_offset + 8192
     initrd_offset = mmio_pd_offset + 4096
-    initrd = initramfs(args.init)
+    initrd = initramfs(args.init) if args.init else b""
     size = align(initrd_offset + len(initrd))
     defines = {
         "IMAGE_BASE": base, "IMAGE_SIZE": size,
         "KERNEL_ENTRY": entry, "RSDP_ADDR": base + acpi_offset,
-        "INITRD_ADDR": base + initrd_offset, "INITRD_SIZE": len(initrd),
+        "INITRD_ADDR": base + initrd_offset if initrd else 0, "INITRD_SIZE": len(initrd),
         "CMDLINE_ADDR": base + cmdline_offset,
         "MMIO_PD_ADDR": base + mmio_pd_offset,
         "BOOT_DATA_BASE": base + bootstrap_offset,

@@ -1,0 +1,287 @@
+--- a/kernel/core/src/fs/fs_impls/virtiofs/fs.rs
++++ b/kernel/core/src/fs/fs_impls/virtiofs/fs.rs
+@@ -16,7 +16,7 @@
+         pseudofs::AnonDeviceId,
+         utils::NAME_MAX,
+         vfs::{
+-            file_system::{FileSystem, FsEventSubscriberStats, SuperBlock},
++            file_system::{FileSystem, FsEventSubscriberStats, FsFlags, SuperBlock},
+             inode::Inode,
+             registry::{FsCache, FsCreationCtx, FsProperties, FsType},
+         },
+@@ -31,11 +31,11 @@
+ const BLOCK_SIZE: usize = 4096;
+ 
+ /// The `virtiofs` filesystem type.
+-pub(super) struct VirtioFsType {
++pub(in crate::fs) struct VirtioFsType {
+     cache: FsCache<String>,
+ }
+ 
+-pub(super) static VIRTIOFS_TYPE: VirtioFsType = VirtioFsType {
++pub(in crate::fs) static VIRTIOFS_TYPE: VirtioFsType = VirtioFsType {
+     cache: FsCache::new(),
+ };
+ 
+@@ -59,7 +59,7 @@
+         let device = device::find_device_by_tag(&tag)
+             .ok_or_else(|| Error::with_message(Errno::ENODEV, "virtiofs device is not found"))?;
+ 
+-        Ok(VirtioFs::new(device, tag)? as Arc<dyn FileSystem>)
++        Ok(VirtioFs::new(device, tag, fs_creation_ctx.flags())? as Arc<dyn FileSystem>)
+     }
+ 
+     fn obtain_key_and_cache(
+@@ -81,13 +81,14 @@
+     sb: SuperBlock,
+     root: Arc<VirtioFsInode>,
+     tag: String,
++    flags: FsFlags,
+     session: Arc<FuseSession>,
+     inode_cache: InodeCache,
+     fs_event_subscriber_stats: FsEventSubscriberStats,
+ }
+ 
+ impl VirtioFs {
+-    fn new(device: Arc<FileSystemDevice>, tag: String) -> Result<Arc<Self>> {
++    fn new(device: Arc<FileSystemDevice>, tag: String, flags: FsFlags) -> Result<Arc<Self>> {
+         let session = FuseSession::new(device)
+             .map_err(|_| Error::with_message(Errno::EIO, "virtiofs FUSE_INIT failed"))?;
+ 
+@@ -116,6 +117,7 @@
+                 sb,
+                 root,
+                 tag,
++                flags,
+                 session,
+                 inode_cache,
+                 fs_event_subscriber_stats: FsEventSubscriberStats::new(),
+@@ -181,6 +183,10 @@
+         Some(&self.tag)
+     }
+ 
++    fn flags(&self) -> FsFlags {
++        self.flags
++    }
++
+     // TODO: Implement `sync` by issuing `fsync` to open files and syncing the device if supported.
+     fn sync(&self) -> Result<()> {
+         Ok(())
+--- a/kernel/core/src/fs/fs_impls/virtiofs/mod.rs
++++ b/kernel/core/src/fs/fs_impls/virtiofs/mod.rs
+@@ -11,6 +11,7 @@
+ use core::time::Duration;
+ 
+ use aster_fuse::FuseError;
++pub(in crate::fs) use fs::VIRTIOFS_TYPE;
+ 
+ use crate::{
+     prelude::{Errno, Error},
+@@ -18,7 +19,7 @@
+ };
+ 
+ pub(super) fn init() {
+-    crate::fs::vfs::registry::register(&fs::VIRTIOFS_TYPE).unwrap();
++    crate::fs::vfs::registry::register(&VIRTIOFS_TYPE).unwrap();
+ }
+ 
+ impl From<FuseError> for Error {
+--- a/kernel/core/src/fs/rootfs.rs
++++ b/kernel/core/src/fs/rootfs.rs
+@@ -6,17 +6,17 @@
+ //! `/init` when `rdinit` is not provided. If the selected path is accessible, Asterinas runs it as
+ //! the first userspace process. Otherwise, Asterinas boots from the root filesystem.
+ //!
+-//! For root filesystem boot, this module mounts a supported filesystem from the block device
+-//! specified by `root`. The mounted filesystem replaces the bootstrap root in the initial mount
+-//! namespace and becomes the root and working directory of the first userspace process. The
+-//! bootstrap root is then detached. The `root` parameter is required when this boot path is
+-//! selected, and [`SUPPORTED_ROOTFS_TYPES`] lists the supported filesystem types.
++//! For root filesystem boot, this module mounts a supported filesystem from the block device or
++//! virtiofs tag specified by `root`. The mounted filesystem replaces the bootstrap root in the
++//! initial mount namespace and becomes the root and working directory of the first userspace
++//! process. The bootstrap root is then detached. Block filesystems require `root`; virtiofs uses
++//! `/dev/root` when it is omitted, matching Linux's root mount fallback.
+ //!
+ //! The following kernel parameters configure root filesystem boot:
+ //!
+-//! - `root` specifies the block device to mount.
+-//! - `rootfstype` specifies a comma-separated list of filesystem type candidates. All supported
+-//!   types are tried when it is not provided.
++//! - `root` specifies the block device or virtiofs tag to mount.
++//! - `rootfstype` specifies a comma-separated list of filesystem type candidates. Supported block
++//!   filesystem types are tried when it is not provided.
+ //! - `ro` and `rw` select read-only or read-write mounting. The root filesystem is read-only by
+ //!   default. They use last-wins semantics: the last `ro` or `rw` parameter determines the mount
+ //!   mode.
+@@ -40,27 +40,34 @@
+ 
+ use super::{
+     ext2,
++    fs_impls::virtiofs,
+     vfs::{
+         file_system::FsFlags,
+         path::{FsPath, Mount, MountNamespace, Path, PathResolver, PerMountFlags},
+-        registry::{DynFsType, FsAndRoot, FsCreationCtx},
++        registry::{DynFsType, FsAndRoot, FsCreationCtx, FsProperties},
+     },
+ };
+ use crate::prelude::*;
+ 
+ /// Filesystem types supported for the root filesystem.
+-pub(crate) static SUPPORTED_ROOTFS_TYPES: &[&dyn DynFsType] = &[&ext2::EXT2_TYPE];
++pub(crate) static SUPPORTED_ROOTFS_TYPES: &[&dyn DynFsType] =
++    &[&ext2::EXT2_TYPE, &virtiofs::VIRTIOFS_TYPE];
++
++// Without `rootfstype`, only probe filesystems backed by a block device.
++static DEFAULT_ROOTFS_TYPES: &[&dyn DynFsType] = &[&ext2::EXT2_TYPE];
+ 
+ /// Mounts and switches to the root filesystem configured by the kernel command line.
+ ///
+ /// The filesystem replaces the bootstrap root mount and becomes the resolver's root and working
+ /// directory.
+ ///
+-/// Returns an error if `root` is not provided or the root filesystem cannot be opened or mounted.
++/// Returns an error if the source is missing or the root filesystem cannot be opened or mounted.
+ pub(crate) fn switch_to_rootfs(path_resolver: &mut PathResolver) -> Result<()> {
+-    let root = ROOT_PATH.get().ok_or_else(|| {
+-        Error::with_message(Errno::EINVAL, "the `root` parameter was not provided")
+-    })?;
++    let root = match ROOT_PATH.get().map(String::as_str) {
++        Some(root) => root,
++        None if rootfs_types().iter().any(|fs_type| !needs_disk(*fs_type)) => "/dev/root",
++        None => return_errno_with_message!(Errno::EINVAL, "the `root` parameter was not provided"),
++    };
+     let (fs_flags, mount_flags) = rootfs_flags();
+     let fs_and_root = open_rootfs(root, fs_flags)?;
+     let rootfs_mount = Mount::new_detached(
+@@ -89,6 +96,29 @@
+ }
+ 
+ fn open_rootfs(root: &str, fs_flags: FsFlags) -> Result<FsAndRoot> {
++    let rootfs_types = rootfs_types();
++    // Linux tries explicitly requested non-block filesystems before its block root path.
++    // The source is a tag for virtiofs, even when it resembles a /dev pathname.
++    for fs_type in rootfs_types
++        .iter()
++        .copied()
++        .filter(|fs_type| !needs_disk(*fs_type))
++    {
++        let mut fs_creation_ctx = FsCreationCtx::from_nodev_source(root, fs_flags, None);
++        match fs_type.get_or_create(&mut fs_creation_ctx) {
++            Ok(fs_and_root) => return Ok(fs_and_root),
++            Err(err) if matches!(err.error(), Errno::EINVAL | Errno::ENODEV) => continue,
++            Err(err) => return Err(err),
++        }
++    }
++
++    if !rootfs_types.iter().any(|fs_type| needs_disk(*fs_type)) {
++        return_errno_with_message!(
++            Errno::ENODEV,
++            "no root filesystem could mount the specified tag"
++        );
++    }
++
+     // Treat a `/dev/...` value of `root` as a Linux-compatible root device spec, not as a VFS path
+     // lookup.
+     // Reference: <https://elixir.bootlin.com/linux/v6.18/source/drivers/base/devtmpfs.c#L358-L359>.
+@@ -97,7 +127,11 @@
+         .ok_or_else(|| Error::with_message(Errno::EINVAL, "root must name a /dev block device"))?;
+     let device = aster_block::lookup_by_name(device_name)
+         .ok_or_else(|| Error::with_message(Errno::ENODEV, "root block device not found"))?;
+-    open_rootfs_from_candidates(device, rootfs_types(), fs_flags)
++    open_rootfs_from_candidates(device, rootfs_types, fs_flags)
++}
++
++fn needs_disk(fs_type: &dyn DynFsType) -> bool {
++    fs_type.properties().contains(FsProperties::NEED_DISK)
+ }
+ 
+ fn open_rootfs_from_candidates(
+@@ -106,7 +140,11 @@
+     fs_flags: FsFlags,
+ ) -> Result<FsAndRoot> {
+     let mut fs_creation_ctx = FsCreationCtx::from_block_device(device, fs_flags, None);
+-    for rootfs_type in rootfs_types {
++    for rootfs_type in rootfs_types
++        .iter()
++        .copied()
++        .filter(|fs_type| needs_disk(*fs_type))
++    {
+         match rootfs_type.get_or_create(&mut fs_creation_ctx) {
+             Ok(fs_and_root) => return Ok(fs_and_root),
+             Err(err) if err.error() == Errno::EINVAL => continue,
+@@ -131,7 +169,7 @@
+     ROOTFS_TYPES
+         .get()
+         .map(RootFsTypes::as_slice)
+-        .unwrap_or(SUPPORTED_ROOTFS_TYPES)
++        .unwrap_or(DEFAULT_ROOTFS_TYPES)
+ }
+ 
+ static ROOT_PATH: Once<String> = Once::new();
+--- a/kernel/core/src/fs/vfs/fs_apis/registry.rs
++++ b/kernel/core/src/fs/vfs/fs_apis/registry.rs
+@@ -112,6 +112,7 @@
+ enum BlockDeviceResolution<'a> {
+     Pending(&'a Context<'a>),
+     Resolved(Arc<dyn BlockDevice>),
++    Unavailable,
+ }
+ 
+ impl<'a> FsCreationCtx<'a> {
+@@ -144,6 +145,20 @@
+         }
+     }
+ 
++    /// Creates a context for mounting a non-block filesystem before userspace starts.
++    pub(in crate::fs) fn from_nodev_source(
++        source: &'a str,
++        flags: FsFlags,
++        args: Option<&'a str>,
++    ) -> Self {
++        Self {
++            source: Some(source),
++            flags,
++            args,
++            block_device: BlockDeviceResolution::Unavailable,
++        }
++    }
++
+     /// Returns the user-supplied mount source.
+     pub(in crate::fs) fn source(&self) -> Option<&str> {
+         self.source
+@@ -159,11 +174,12 @@
+         self.args
+     }
+ 
+-    /// Returns the task context the creation started from; `None` once a block device replaced it.
++    /// Returns the task context, if creation started from syscall inputs and has not resolved
++    /// a device.
+     pub(in crate::fs) fn ctx(&self) -> Option<&'a Context<'a>> {
+         match &self.block_device {
+             BlockDeviceResolution::Pending(task_ctx) => Some(*task_ctx),
+-            BlockDeviceResolution::Resolved(_) => None,
++            BlockDeviceResolution::Resolved(_) | BlockDeviceResolution::Unavailable => None,
+         }
+     }
+ 
+@@ -178,7 +194,7 @@
+ 
+     fn block_device(&self) -> Option<&Arc<dyn BlockDevice>> {
+         match &self.block_device {
+-            BlockDeviceResolution::Pending(_) => None,
++            BlockDeviceResolution::Pending(_) | BlockDeviceResolution::Unavailable => None,
+             BlockDeviceResolution::Resolved(block_device) => Some(block_device),
+         }
+     }
+@@ -187,6 +203,9 @@
+         let task_ctx = match &self.block_device {
+             BlockDeviceResolution::Pending(task_ctx) => *task_ctx,
+             BlockDeviceResolution::Resolved(_) => return Ok(()),
++            BlockDeviceResolution::Unavailable => {
++                return_errno_with_message!(Errno::ENODEV, "no block device was provided")
++            }
+         };
+ 
+         let source = self

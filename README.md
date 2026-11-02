@@ -53,7 +53,7 @@ when a parent path contains `src/`. The RPM build script handles this.
 
 ```sh
 sudo dnf install podman crun-krun passt
-sudo dnf install --allowerasing ./dist/rpmbuild/RPMS/x86_64/libkrunfw-asterinas-0.1.0-5.fc44.x86_64.rpm
+sudo dnf install --allowerasing ./dist/rpmbuild/RPMS/x86_64/libkrunfw-asterinas-0.1.0-6.fc44.x86_64.rpm
 
 sudo podman network create --subnet 10.0.2.0/24 --gateway 10.0.2.2 asterinas
 sudo podman run -d --name asterinas-nginx --runtime /usr/bin/krun \
@@ -178,3 +178,33 @@ The wrapper and bootstrap are MIT licensed; the Asterinas kernel is MPL-2.0.
 The initramfs contains Fedora glibc runtime libraries, with license
 notices included in the RPM. Provenance is recorded in `upstream.json` and the
 generated `kernel-build.json`, `kernel-Cargo.lock`, and `layout.json`.
+
+## Direct virtiofs root boot
+
+The kernel also supports booting directly from virtiofs without an initramfs.
+With `rootfstype=virtiofs`, `root=TAG` selects a virtiofs tag rather than a block
+device. If `root` is omitted, the source defaults to `/dev/root`, matching Linux's
+root mount fallback and stock krun's default export tag. The kernel mounts the
+share as `/`, mounts devtmpfs, and starts the program selected by `init`, normally
+libkrun's injected `/init.krun`. Explicit tags must exist; `ro` and `rw` control
+root write access. Ext2 root boot and initramfs init selection remain supported.
+
+The RPM includes this firmware under `/usr/lib64/libkrunfw-asterinas/rootfs/`.
+For a console-only command using stock krun:
+
+```sh
+sudo env LD_LIBRARY_PATH=/usr/lib64/libkrunfw-asterinas/rootfs \
+    podman run --rm --runtime /usr/bin/krun --network none \
+    --security-opt seccomp=unconfined --pid host \
+    docker.io/library/nginx:stable /bin/sh -c 'cat /proc/mounts; exit 7'
+```
+
+The default firmware retains the initramfs bootstrap for the current static
+networking and `/dev/std*` setup. Direct root boot runs stock init without those
+workarounds; use the default firmware for the nginx HTTP example above.
+
+`make BOOT_MODE=rootfs` inside the Fedora builder produces the direct root
+firmware under `build/rootfs/`, sharing the kernel built under `build/`.
+`python3 tools/rootfs-test.py CONTAINER` checks the RPM in a retained Fedora test
+container: no initramfs, root mounted from the default tag, stock init, and exit
+status 7 through Podman. Its output is saved in `build/rootfs-test.log`.

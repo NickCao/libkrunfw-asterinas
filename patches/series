@@ -1,2 +1,3 @@
 0001-virtio-console-multiport.patch
 0002-support-libkrun-guest-init.patch
+0003-virtiofs-root-boot.patch
