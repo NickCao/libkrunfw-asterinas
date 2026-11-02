@@ -18,7 +18,7 @@ for name, expected, command in cases:
     log = Path("build") / f"smoke-{name}.log"
     log.write_bytes(result.stdout)
     output = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout.decode(errors="replace"))
-    if result.returncode != expected or f"ASTERINAS_POC_EXIT={expected}" not in output:
+    if result.returncode != expected:
         raise SystemExit(f"{name}: expected exit {expected}, got {result.returncode}; see {log}")
     if name == "success" and not all(s in output for s in ["ARGUMENT_TEST=<a b>", "Fedora release", "x86_64"]):
         raise SystemExit(f"{name}: guest output missing; see {log}")

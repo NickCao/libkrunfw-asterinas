@@ -1,0 +1,268 @@
+--- a/kernel/core/src/device/virtio_port.rs
++++ b/kernel/core/src/device/virtio_port.rs
+@@ -2,6 +2,10 @@
+ 
+ //! Raw virtio serial ports, independent of the console's terminal processing.
+ 
++use aster_device::{
++    class::{self, Class, ClassDevice},
++    common::Attr,
++};
+ use aster_virtio::device::console::{device, port::ConsolePort};
+ use device_id::{DeviceId, MinorId};
+ 
+@@ -11,16 +15,28 @@
+     fs::{
+         devtmpfs::DevtmpfsNodeMeta,
+         file::{PerOpenFileOps, StatusFlags},
+-        vfs::{inode::FileOps, path::Path},
++        vfs::inode::FileOps,
+     },
+     prelude::*,
+     process::signal::{PollHandle, Pollable, Pollee},
+-    util::ioctl::{OutData, RawIoctl},
+ };
+ 
+-// Bootstrap discovery until virtio-ports sysfs/udev integration is available.
+-// Private PoC ABI: _IOR('V', 0, char[128]), a NUL-terminated port name.
+-type GetPortName = crate::ioc!(VPORT_GET_NAME, b'V', 0, OutData<[u8; 128]>);
++struct VirtioPortsClass;
++
++const PORT_ATTRIBUTES: &[Attr<ClassDevice<VirtioPortsClass>>] =
++    &[Attr::ro("name", |device, writer| {
++        writeln!(writer, "{}", device.info().name)?;
++        Ok(())
++    })];
++
++impl Class for VirtioPortsClass {
++    const NAME: &'static str = "virtio-ports";
++    type Device = Arc<ConsolePort>;
++
++    fn dev_attrs(&self) -> &'static [Attr<ClassDevice<Self>>] {
++        PORT_ATTRIBUTES
++    }
++}
+ 
+ struct PortState {
+     port: Arc<ConsolePort>,
+@@ -133,27 +149,11 @@
+     fn is_offset_aware(&self) -> bool {
+         false
+     }
+-    fn ioctl(&self, _path: &Path, raw_ioctl: RawIoctl) -> Result<i32> {
+-        crate::dispatch_ioctl!(match raw_ioctl {
+-            cmd @ GetPortName => {
+-                let info = self.state.port.info();
+-                if info.is_console {
+-                    return_errno_with_message!(Errno::ENODATA, "the port is a console");
+-                }
+-                if !info.present || info.name.is_empty() {
+-                    return_errno_with_message!(Errno::EAGAIN, "the port name is not available");
+-                }
+-                let mut name = [0; 128];
+-                name[..info.name.len()].copy_from_slice(info.name.as_bytes());
+-                cmd.write(&name)?;
+-            }
+-            _ => return_errno_with_message!(Errno::ENOTTY, "the port ioctl is not supported"),
+-        });
+-        Ok(0)
+-    }
+ }
+ 
+ pub(super) fn init_in_first_process() -> Result<()> {
++    let class = class::register(VirtioPortsClass)
++        .map_err(|_| Error::with_message(Errno::EIO, "failed to register virtio port class"))?;
+     let ports = device::ports();
+     if ports.is_empty() {
+         return Ok(());
+@@ -161,6 +161,11 @@
+     // The registry and open files hold the devices for the kernel's lifetime.
+     let major = Arc::new(char::allocate_major()?);
+     for (index, port) in ports.into_iter().enumerate() {
++        let name = alloc::format!("vport{}p{}", port.device_index(), port.id());
++        let sysfs_device = ClassDevice::builder(&class, name, port.clone()).build();
++        aster_device::add_device(&sysfs_device).map_err(|_| {
++            Error::with_message(Errno::EIO, "failed to register virtio port sysfs node")
++        })?;
+         let state = Arc::new(PortState {
+             port,
+             pollee: Pollee::new(),
+--- a/kernel/core/src/fs/fs_impls/virtiofs/dir.rs
++++ b/kernel/core/src/fs/fs_impls/virtiofs/dir.rs
+@@ -2,7 +2,10 @@
+ 
+ //! Open directory handles for `virtiofs`.
+ 
+-use aster_fuse::{FsyncFlags, FuseOpenFlags};
++use aster_fuse::{
++    FsyncFlags, FuseInitFlags, FuseOpenFlags,
++    ops::ioctl::{IOCTL_DIRECTORY, ScalarIoctlOperation},
++};
+ 
+ use super::{inode::VirtioFsInode, open_handle::VirtioFsOpenHandle};
+ use crate::{
+@@ -10,10 +13,14 @@
+     fs::{
+         file::{PerOpenFileOps, StatusFlags, SyncMode},
+         utils::DirentVisitor,
+-        vfs::inode::{FileOps, Inode},
++        vfs::{
++            inode::{FileOps, Inode},
++            path::Path,
++        },
+     },
+     prelude::*,
+     process::signal::{PollHandle, Pollable},
++    util::ioctl::RawIoctl,
+ };
+ 
+ /// A per-open directory object backed by a FUSE open handle.
+@@ -70,6 +77,38 @@
+ }
+ 
+ impl PerOpenFileOps for VirtioFsDir {
++    fn ioctl(&self, _path: &Path, command: RawIoctl) -> Result<i32> {
++        // libkrun's init reports the workload's status on the virtiofs root.
++        // Support this scalar protocol without exposing arbitrary pointer ioctls.
++        const KRUN_EXIT_CODE_IOCTL: u32 = 0x7602;
++        if command.cmd() != KRUN_EXIT_CODE_IOCTL {
++            return_errno_with_message!(Errno::ENOTTY, "the directory ioctl is not supported");
++        }
++        if command.arg() > 255 {
++            return_errno_with_message!(Errno::EINVAL, "the exit status is invalid");
++        }
++        let fs = self.inode.fs_ref();
++        if !fs
++            .session()
++            .negotiated_flags()
++            .contains(FuseInitFlags::HAS_IOCTL_DIR)
++        {
++            return_errno_with_message!(
++                Errno::ENOTTY,
++                "the server does not support directory ioctls"
++            );
++        }
++        Ok(fs.session().do_fuse_op(
++            self.inode.nodeid(),
++            ScalarIoctlOperation::new(
++                self.open_handle.fh(),
++                IOCTL_DIRECTORY,
++                command.cmd(),
++                command.arg() as u64,
++            ),
++        )?)
++    }
++
+     fn check_seekable(&self) -> Result<()> {
+         if self
+             .open_handle
+--- a/kernel/core/comps/virtio/src/device/filesystem/device/session.rs
++++ b/kernel/core/comps/virtio/src/device/filesystem/device/session.rs
+@@ -164,6 +164,7 @@
+             | FuseInitFlags::AUTO_INVAL_DATA
+             | FuseInitFlags::BIG_WRITES
+             | FuseInitFlags::HANDLE_KILLPRIV
++            | FuseInitFlags::HAS_IOCTL_DIR
+             | FuseInitFlags::MAX_PAGES
+             | FuseInitFlags::PARALLEL_DIROPS
+             | FuseInitFlags::INIT_EXT
+--- a/kernel/libs/aster-fuse/src/ops/mod.rs
++++ b/kernel/libs/aster-fuse/src/ops/mod.rs
+@@ -19,6 +19,7 @@
+ pub mod fsync;
+ pub mod getattr;
+ pub mod init;
++pub mod ioctl;
+ pub mod link;
+ pub mod lookup;
+ pub mod lseek;
+--- /dev/null
++++ b/kernel/libs/aster-fuse/src/ops/ioctl.rs
+@@ -0,0 +1,87 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Restricted scalar `FUSE_IOCTL` requests without input/output payloads.
++//!
++//! Reference: Linux UAPI `include/uapi/linux/fuse.h`, `fuse_ioctl_in/out`.
++
++use ostd::mm::{Infallible, VmReader, VmWriter};
++
++use crate::{FuseError, FuseFileHandle, FuseOpcode, FuseOperation, FuseResult, ReplyExpectation};
++
++/// The target inode is a directory (`FUSE_IOCTL_DIR`).
++pub const IOCTL_DIRECTORY: u32 = 1 << 4;
++
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Pod)]
++struct IoctlReq {
++    fh: FuseFileHandle,
++    flags: u32,
++    cmd: u32,
++    arg: u64,
++    in_size: u32,
++    out_size: u32,
++}
++
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Pod)]
++struct IoctlReply {
++    result: i32,
++    flags: u32,
++    in_iovs: u32,
++    out_iovs: u32,
++}
++
++/// An ioctl with an immediate argument and no copied payload or retry vectors.
++pub struct ScalarIoctlOperation {
++    request: IoctlReq,
++}
++
++impl ScalarIoctlOperation {
++    pub const fn new(fh: FuseFileHandle, flags: u32, cmd: u32, arg: u64) -> Self {
++        Self {
++            request: IoctlReq {
++                fh,
++                flags,
++                cmd,
++                arg,
++                in_size: 0,
++                out_size: 0,
++            },
++        }
++    }
++}
++
++impl FuseOperation for ScalarIoctlOperation {
++    type Output = i32;
++
++    fn opcode(&self) -> FuseOpcode {
++        FuseOpcode::Ioctl
++    }
++    fn body_len(&self) -> usize {
++        size_of::<IoctlReq>()
++    }
++    fn write_body(&mut self, writer: &mut VmWriter<'_, Infallible>) -> FuseResult<()> {
++        writer
++            .write_val(&self.request)
++            .map_err(|_| FuseError::BufferTooSmall)
++    }
++    fn reply_expectation(&self) -> ReplyExpectation {
++        ReplyExpectation::payload(size_of::<IoctlReply>())
++    }
++    fn parse_reply(payload_len: usize, reader: &mut VmReader<'_, Infallible>) -> FuseResult<i32> {
++        if payload_len != size_of::<IoctlReply>() {
++            return Err(FuseError::MalformedResponse);
++        }
++        let reply: IoctlReply = reader
++            .read_val()
++            .map_err(|_| FuseError::MalformedResponse)?;
++        // Never accept unrestricted retries or host-provided user-memory vectors.
++        if reply.flags != 0 || reply.in_iovs != 0 || reply.out_iovs != 0 {
++            return Err(FuseError::MalformedResponse);
++        }
++        if reply.result < 0 {
++            return Err(FuseError::RemoteError(reply.result));
++        }
++        Ok(reply.result)
++    }
++}

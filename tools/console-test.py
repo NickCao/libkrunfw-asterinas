@@ -21,7 +21,7 @@ image = "docker.io/library/nginx:stable"
 payload = bytes(range(256)) * 128
 
 
-def check(name, command, data, markers, tty=False):
+def check(name, command, data, markers, tty=False, expected=0):
     guest_name = f"console-{name}"
     run = podman + ["run", "--name", guest_name, "-i"] + runtime
     if tty:
@@ -66,8 +66,10 @@ def check(name, command, data, markers, tty=False):
         for stream, marker in markers:
             if marker not in output[stream]:
                 raise SystemExit(f"{name}: missing {marker!r}; see build/console-{name}-*.log")
+        result = process.wait(timeout=15)
+        if result != expected:
+            raise SystemExit(f"{name}: expected exit {expected}, got {result}")
     finally:
-        # Guest exit propagation remains a separate bootstrap feature.
         for operation in ("kill", "rm"):
             subprocess.run([engine, "exec", container] + podman + [operation, guest_name],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
@@ -87,3 +89,6 @@ print("PASS: separate stdout/stderr, 32 KiB binary stdin round trip, host EOF", 
 out, _ = check("tty", 'test -t 0 && printf "TTY_READY\\n"; stty size; read line; printf "TTY_INPUT=<%s>\\n" "$line"',
                b"terminal-input\n", [(0, b"TTY_READY"), (0, b"37 101"), (0, b"TTY_INPUT=<terminal-input>")], tty=True)
 print("PASS: interactive console input and initial 37x101 terminal size", flush=True)
+
+check("exit7", "printf EXIT7_OK; exit 7", b"", [(0, b"EXIT7_OK")], expected=7)
+print("PASS: guest exit 7 propagates through stock krun and Podman", flush=True)

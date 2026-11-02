@@ -64,22 +64,29 @@ def checksum(data, offset):
     return bytes(data)
 
 
-def table(signature, body):
-    header = struct.pack("<4sIBB6s8sI4sI", signature, 36 + len(body), 1, 0, b"ASTER ", b"KRUNPOC ", 1, b"ASTR", 1)
+def table(signature, body, revision=1):
+    header = struct.pack("<4sIBB6s8sI4sI", signature, 36 + len(body), revision, 0, b"ASTER ", b"KRUNPOC ", 1, b"ASTR", 1)
     return checksum(bytearray(header + body), 9)
 
 
 def acpi(address):
-    # A single CPU and the standard KVM local/I/O APIC addresses. No AML is needed.
-    madt_address = address + 80
-    xsdt = table(b"XSDT", struct.pack("<Q", madt_address))
+    # A single CPU, standard KVM APIC addresses and libkrun's emulated reset.
+    madt_address = address + 88
     madt = table(b"APIC", struct.pack("<II", 0xfee00000, 1)
                  + struct.pack("<BBBBI", 0, 8, 0, 0, 1)
                  + struct.pack("<BBBBII", 1, 12, 0, 0, 0xfec00000, 0))
+    fadt_address = madt_address + len(madt)
+    # ACPI 6.x FADT, section 5.2.9: RESET_REG is a Generic Address Structure.
+    fadt_body = bytearray(276 - 36)
+    struct.pack_into("<I", fadt_body, 112 - 36, 1 << 10)  # RESET_REG_SUP
+    struct.pack_into("<BBBBQ", fadt_body, 116 - 36, 1, 8, 0, 1, 0x64)
+    fadt_body[128 - 36] = 0xfe
+    fadt = table(b"FACP", fadt_body, revision=6)
+    xsdt = table(b"XSDT", struct.pack("<QQ", madt_address, fadt_address))
     rsdp = bytearray(struct.pack("<8sB6sBIIQB3s", b"RSD PTR ", 0, b"ASTER ", 2, 0, 36, address + 36, 0, b"\0" * 3))
     rsdp[8] = (-sum(rsdp[:20])) & 255
     rsdp = checksum(rsdp, 32)
-    return rsdp + xsdt + madt
+    return rsdp + xsdt + madt + fadt
 
 
 def cpio_entry(name, mode, data=b"", major=0, minor=0):

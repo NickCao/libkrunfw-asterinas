@@ -60,15 +60,6 @@ static void enter_vm(int argc, char **argv, int output)
     exit(125);
 }
 
-static int guest_status(const char *line)
-{
-    const char prefix[] = "ASTERINAS_POC_EXIT=";
-    if (strncmp(line, prefix, sizeof(prefix) - 1)) return -1;
-    char *end;
-    long status = strtol(line + sizeof(prefix) - 1, &end, 10);
-    return *end == 0 && end != line + sizeof(prefix) - 1 && status >= 0 && status <= 255 ? (int)status : -1;
-}
-
 int main(int argc, char **argv)
 {
     if (argc < 3) {
@@ -87,37 +78,20 @@ int main(int argc, char **argv)
         enter_vm(argc, argv, stream[1]);
     }
     close(stream[1]);
-    char buffer[4096], line[512];
-    size_t used = 0;
-    bool overflow = false;
-    int status = -1;
+    char buffer[4096];
+    int status;
     for (;;) {
         ssize_t size = read(stream[0], buffer, sizeof(buffer));
         if (size < 0 && errno == EINTR) continue;
         if (size <= 0) break;
-        if (fwrite(buffer, 1, (size_t)size, stdout) != (size_t)size || fflush(stdout)) break;
-        for (ssize_t i = 0; i < size; ++i) {
-            if (buffer[i] == '\r') continue;
-            if (buffer[i] == '\n') {
-                line[used] = 0;
-                if (!overflow) status = guest_status(line);
-                used = 0;
-                overflow = false;
-                if (status >= 0) break;
-            } else if (used < sizeof(line) - 1) {
-                line[used++] = buffer[i];
-            } else {
-                overflow = true;
-            }
+        if (fwrite(buffer, 1, (size_t)size, stdout) != (size_t)size || fflush(stdout)) {
+            kill(child, SIGKILL);
+            break;
         }
-        if (status >= 0) break;
     }
     close(stream[0]);
-    kill(child, SIGKILL);
-    while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
-    if (status < 0) {
-        fputs("VM ended without a guest completion status\n", stderr);
-        return 125;
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno != EINTR) { perror("waitpid"); return 125; }
     }
-    return status;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
 }

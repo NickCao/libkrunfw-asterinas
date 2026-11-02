@@ -58,7 +58,5 @@ podman --cgroup-manager=cgroupfs --storage-driver=vfs inspect \
 FEDORA
 python3 tools/check-nginx.py "$port"
 collect_guest_log
-grep -Fq 'Asterinas libkrunfw bootstrap' build/nginx-guest.log
-grep -Fq 'Network eth0: 10.0.2.15' build/nginx-guest.log
 grep -Fq '"GET / HTTP/1.1" 200 ' build/nginx-guest.log
 printf 'PASS: host HTTP request reached nginx inside Asterinas through stock Fedora krun/libkrun\n'

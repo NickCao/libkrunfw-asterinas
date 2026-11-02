@@ -3,7 +3,7 @@
 %global vdso_commit 8af571775a3d3a1df3e84fc9709b9d6b160c771a
 Name:           libkrunfw-asterinas
 Version:        0.1.0
-Release:        4%{?dist}
+Release:        5%{?dist}
 Summary:        Experimental Asterinas guest payload for libkrun
 License:        MIT AND MPL-2.0 AND LGPL-2.1-or-later
 URL:            https://github.com/NickCao/libkrunfw-asterinas
@@ -47,7 +47,6 @@ python3 tools/fetch-sources.py --cache %{_sourcedir} --offline
 tar -xf %{SOURCE1}
 tar -xf %{SOURCE2}
 cp -a /usr/share/licenses/glibc licenses/guest-glibc
-cp -a /usr/share/licenses/json-c licenses/guest-json-c
 
 %build
 bash tools/build-kernel.sh "$PWD/asterinas-%{asterinas_commit}" "$PWD/linux_vdso-%{vdso_commit}"
@@ -68,7 +67,7 @@ install -Dpm0644 examples/nginx.conf %{buildroot}%{_datadir}/%{name}/nginx.conf
 cp -a patches %{buildroot}%{_datadir}/%{name}/patches
 
 %files
-%license LICENSE licenses/ASTERINAS-MPL-2.0 licenses/guest-glibc licenses/guest-json-c
+%license LICENSE licenses/ASTERINAS-MPL-2.0 licenses/guest-glibc
 %doc README.md
 %{_bindir}/libkrunfw-asterinas-run
 %{_libexecdir}/%{name}/
@@ -76,6 +75,11 @@ cp -a patches %{buildroot}%{_datadir}/%{name}/patches
 %{_datadir}/%{name}/
 
 %changelog
+* Mon Nov 02 2026 Nick Cao <nickcao@nichi.co> - 0.1.0-5
+- Hand off PID 1 to stock libkrun's unmodified init binary
+- Expose virtio-port names in sysfs and forward libkrun's exit-status ioctl
+- Supply an ACPI reset register so guest completion terminates the VM
+
 * Mon Nov 02 2026 Nick Cao <nickcao@nichi.co> - 0.1.0-4
 - Add Asterinas multiport virtio-console queues, control messages and raw ports
 - Route OCI stdio through stock krun's console and named pipe ports

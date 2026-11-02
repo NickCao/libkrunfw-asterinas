@@ -14,7 +14,7 @@ $(BUILD)/asterinas.elf: upstream.json tools/build-kernel.sh tools/fetch-sources.
 
 $(BUILD)/init: src/init.c
 	mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ $< -ljson-c
+	$(CC) $(CFLAGS) -o $@ $<
 
 $(BUILD)/run: src/run.c
 	mkdir -p $(BUILD)

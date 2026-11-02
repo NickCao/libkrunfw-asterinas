@@ -19,11 +19,17 @@ class BootDataTests(unittest.TestCase):
         self.assertEqual(sum(data[:36]) % 256, 0)
         self.assertEqual(struct.unpack_from("<Q", data, 24)[0], base + 36)
         self.assertEqual(data[36:40], b"XSDT")
-        self.assertEqual(sum(data[36:80]) % 256, 0)
-        self.assertEqual(struct.unpack_from("<Q", data, 72)[0], base + 80)
-        self.assertEqual(data[80:84], b"APIC")
-        self.assertEqual(sum(data[80:]) % 256, 0)
-        self.assertEqual(struct.unpack_from("<I", data, 116)[0], 0xfee00000)
+        xsdt_length = struct.unpack_from("<I", data, 40)[0]
+        self.assertEqual(sum(data[36:36 + xsdt_length]) % 256, 0)
+        madt, fadt = (pointer - base for pointer in struct.unpack_from("<QQ", data, 72))
+        self.assertEqual(madt, 36 + xsdt_length)
+        self.assertEqual(data[madt:madt + 4], b"APIC")
+        self.assertEqual(sum(data[madt:fadt]) % 256, 0)
+        self.assertEqual(struct.unpack_from("<I", data, madt + 36)[0], 0xfee00000)
+        self.assertEqual(data[fadt:fadt + 4], b"FACP")
+        self.assertEqual(sum(data[fadt:]) % 256, 0)
+        self.assertEqual(struct.unpack_from("<BBBBQ", data, fadt + 116), (1, 8, 0, 1, 0x64))
+        self.assertEqual(data[fadt + 128], 0xfe)
 
     def test_rejects_wrong_elf_format(self):
         with self.assertRaises(ValueError):

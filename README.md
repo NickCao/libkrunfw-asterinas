@@ -53,7 +53,7 @@ when a parent path contains `src/`. The RPM build script handles this.
 
 ```sh
 sudo dnf install podman crun-krun passt
-sudo dnf install --allowerasing ./dist/rpmbuild/RPMS/x86_64/libkrunfw-asterinas-0.1.0-4.fc44.x86_64.rpm
+sudo dnf install --allowerasing ./dist/rpmbuild/RPMS/x86_64/libkrunfw-asterinas-0.1.0-5.fc44.x86_64.rpm
 
 sudo podman network create --subnet 10.0.2.0/24 --gateway 10.0.2.2 asterinas
 sudo podman run -d --name asterinas-nginx --runtime /usr/bin/krun \
@@ -90,8 +90,11 @@ The patched driver negotiates virtio-console multiport, exchanges device/port
 readiness messages, and gives each port independent receive/transmit queues.
 `/dev/hvc0` uses the existing TTY line discipline. Raw `/dev/vport0pN` devices
 carry krun's named `krun-stdin`, `krun-stdout`, and `krun-stderr` streams without
-terminal processing. The bootstrap selects streams by name, rather than assuming
-fixed port numbers, and creates the corresponding `/dev/virtio-ports/` aliases.
+terminal processing. Standard port names are exposed through
+`/sys/class/virtio-ports/vport0pN/name`. Fedora libkrun's unmodified `/init.krun`
+selects the streams and launches the OCI command. Our small initramfs bootstrap
+mounts the root share, supplies standard `/dev/std*` links, prepares static
+networking, and hands PID 1 to that injected binary.
 
 Container output is available through normal Podman logging:
 
@@ -107,13 +110,17 @@ signal its foreground process group. Kernel diagnostic output is best effort
 when its console queue fills, so logging cannot wait on host I/O with interrupts
 disabled. The PoC supports one console and up to 32 ports per device, with ports
 opened during discovery. General hotplug/reopen handling is not implemented.
-Port-name discovery currently uses a private bootstrap ioctl; sysfs/udev port
-discovery remains future work.
 
-Guest exec, graceful guest signal delivery, and guest exit-status propagation
-are not implemented. A completed guest command
-leaves the Podman VM running until killed. The PoC supports root guest commands,
-one container at the fixed network address, and IPv4. Nginx reports unavailable
+Workload exit status follows libkrun's normal protocol: its init sends ioctl
+`0x7602` through the virtiofs root, syncs, and resets the VM using the ACPI reset
+register. The VMM exits with that status, so foreground `podman run` returns the
+guest's code and the container stops normally.
+
+`podman exec` remains unsupported by the stock krun versions used here
+([upstream issue](https://github.com/containers/crun/issues/2090)). Graceful
+delivery of arbitrary host signals into the guest remains outside this PoC.
+Validation covers root guest commands, one container at the fixed network
+address, and IPv4. Nginx reports unavailable
 Linux AIO (`io_setup`) and continues using epoll and ordinary file I/O.
 
 ## Validation
@@ -139,7 +146,7 @@ also block a newer Fedora passt binary before the VM starts.
 For a small console smoke check, run `python3 tools/console-test.py CONTAINER`
 with the Fedora container name printed by a retained nginx test. It checks
 separate stdout/stderr, a 32 KiB binary stdin round trip and EOF, plus interactive
-console input and initial terminal dimensions. Logs are saved under
+console input and initial terminal dimensions, and Podman exit status 7. Logs are saved under
 `build/console-*`.
 
 `make check` inside the Fedora builder verifies the firmware ABI, alignment,
@@ -149,21 +156,25 @@ The direct C API smoke test checks argument preservation and nonzero exit status
 ## Boot plumbing and direct launcher
 
 The kernel's ELF load segments are flattened, including zero-filled memory.
-A boot stub chooses Asterinas's Linux64 entry, supplies a single-CPU ACPI MADT,
+A boot stub chooses Asterinas's Linux64 entry, supplies a single-CPU ACPI MADT
+and a FADT with libkrun's emulated reset register,
 attaches an initramfs, and preserves libkrun's root-share and network devices.
-The bootstrap mounts `/dev/root` through virtio-fs and runs the OCI process config
-written by stock krun. It sends an initial packet so passt can learn the static
-guest's Ethernet address without a DHCP exchange.
+The bootstrap mounts `/dev/root` through virtio-fs and executes the unmodified
+`/init.krun` injected by stock libkrun. That init handles the OCI process config,
+stdio redirection, process supervision and exit reporting. The bootstrap sends
+an initial packet so passt can learn the static guest's Ethernet address and
+disables DHCP while Asterinas's network configuration remains fixed.
+The boot shim removes the Linux-only TSI flag so the upstream init leaves
+socket hijacking disabled on console-only VMs too.
 
 `libkrunfw-asterinas-run ROOT COMMAND [ARG...]` remains available for direct C API
 tests with an extracted, disposable root filesystem. It selects libkrun's serial
 console API and explicitly disables TSI/vsock. Set `ASTERINAS_PASST_SOCKET` to an
 existing passt stream socket to enable virtio-net; otherwise networking is off.
-The host launcher observes `ASTERINAS_POC_EXIT=<status>` on serial output, kills
-the VM, and returns that status. Workloads must not print that reserved control
-line; this is not a secure process-supervision protocol.
+The host launcher relays serial output and returns the VMM process's exit code.
+It uses the same upstream init and exit protocol as the Podman path.
 
 The wrapper and bootstrap are MIT licensed; the Asterinas kernel is MPL-2.0.
-The initramfs contains Fedora glibc and json-c runtime libraries, with license
+The initramfs contains Fedora glibc runtime libraries, with license
 notices included in the RPM. Provenance is recorded in `upstream.json` and the
 generated `kernel-build.json`, `kernel-Cargo.lock`, and `layout.json`.

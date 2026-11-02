@@ -72,7 +72,10 @@ void boot_prepare(unsigned char *params)
     for (const char *s = input; s < end;) {
         const char *token = s;
         while (s < end && *s != ' ') ++s;
-        while (token < s) *output++ = *token++;
+        /* Asterinas has no Linux TSI socket hooks. Do not advertise them to
+         * libkrun's init, including on VMs without a virtio-net device. */
+        if (!(s - token == 10 && starts(token, s, "tsi_hijack")))
+            while (token < s) *output++ = *token++;
         if (s < end) *output++ = *s++;
     }
     *output = 0;
