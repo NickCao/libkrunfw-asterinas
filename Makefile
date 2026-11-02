@@ -17,7 +17,7 @@ $(BUILD)/run: src/run.c
 	mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $< -lkrun -ljson-c
 
-$(BUILD)/payload/layout.h: $(BUILD)/asterinas.elf $(BUILD)/init tools/pack.py src/entry.S
+$(BUILD)/payload/layout.h: $(BUILD)/asterinas.elf $(BUILD)/init tools/pack.py src/entry.S src/boot.c src/boot.ld
 	python3 tools/pack.py $(BUILD)/asterinas.elf $(BUILD)/init $(BUILD)/payload
 
 $(BUILD)/libkrunfw.so.5: src/firmware.c $(BUILD)/payload/layout.h

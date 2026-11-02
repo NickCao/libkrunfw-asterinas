@@ -31,7 +31,12 @@ static void enter_vm(int argc, char **argv, int output)
     check(krun_set_vm_config(ctx, 1, 1024), "configure VM");
     check(krun_set_root(ctx, argv[1]), "set root");
     check(krun_disable_implicit_console(ctx), "disable multiport console");
-    check(krun_disable_implicit_vsock(ctx), "disable networking");
+    check(krun_disable_implicit_vsock(ctx), "disable TSI/vsock");
+    const char *network = getenv("ASTERINAS_PASST_SOCKET");
+    if (network) {
+        uint8_t mac[] = {0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee};
+        check(krun_add_net_unixstream(ctx, network, -1, mac, COMPAT_NET_FEATURES, 0), "add virtio-net");
+    }
     check(krun_set_kernel_console(ctx, "ttyS0"), "select serial console");
     check(krun_add_serial_console_default(ctx, -1, output), "add serial console");
     /* Pass arguments without Linux/Asterinas boot-command-line quoting differences. */

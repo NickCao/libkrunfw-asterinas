@@ -125,7 +125,8 @@ def main():
     bootstrap_offset = len(image)
     acpi_offset = bootstrap_offset + 4096
     cmdline_offset = acpi_offset + 4096
-    initrd_offset = cmdline_offset + 8192
+    mmio_pd_offset = cmdline_offset + 8192
+    initrd_offset = mmio_pd_offset + 4096
     initrd = initramfs(args.init)
     size = align(initrd_offset + len(initrd))
     defines = {
@@ -133,12 +134,15 @@ def main():
         "KERNEL_ENTRY": entry, "RSDP_ADDR": base + acpi_offset,
         "INITRD_ADDR": base + initrd_offset, "INITRD_SIZE": len(initrd),
         "CMDLINE_ADDR": base + cmdline_offset,
+        "MMIO_PD_ADDR": base + mmio_pd_offset,
         "BOOT_DATA_BASE": base + bootstrap_offset,
         "BOOT_DATA_SIZE": size - bootstrap_offset,
     }
     root = Path(__file__).resolve().parents[1]
+    (args.output / "layout.h").write_text("".join(f"#define {k} {v}UL\n" for k, v in defines.items()))
     subprocess.run(["gcc", "-c", "-nostdlib", *[f"-D{k}={v}" for k, v in defines.items()], str(root / "src/entry.S"), "-o", str(args.output / "entry.o")], check=True)
-    subprocess.run(["objcopy", "-O", "binary", "-j", ".text", str(args.output / "entry.o"), str(args.output / "entry.bin")], check=True)
+    subprocess.run(["gcc", "-c", "-Os", "-ffreestanding", "-fno-pie", "-fno-stack-protector", "-fno-asynchronous-unwind-tables", "-fno-tree-loop-distribute-patterns", "-mno-red-zone", "-mgeneral-regs-only", "-I" + str(args.output), str(root / "src/boot.c"), "-o", str(args.output / "boot.o")], check=True)
+    subprocess.run(["ld", "--defsym=BOOT_BASE=" + str(base + bootstrap_offset), "-T", str(root / "src/boot.ld"), "--oformat=binary", str(args.output / "entry.o"), str(args.output / "boot.o"), "-o", str(args.output / "entry.bin")], check=True)
     bootstrap = (args.output / "entry.bin").read_bytes()
     if len(bootstrap) > 4096:
         raise ValueError("Boot code exceeds reserved space")

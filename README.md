@@ -1,89 +1,125 @@
 # libkrunfw-asterinas
 
-A minimal x86-64 boot proof of concept using Asterinas as the guest kernel
-for **Fedora's unmodified libkrun 1.19.x**. The kernel is an upstream prebuilt
-artifact; only the firmware wrapper, boot data, and small launcher are built here.
+An x86-64 proof of concept running Asterinas with **Fedora's unmodified Podman,
+crun-krun and libkrun packages**. This RPM provides `libkrunfw.so.5` and replaces
+Fedora's Linux firmware package. It uses the upstream prebuilt Asterinas kernel
+pinned in [upstream.json](upstream.json); no kernel or VMM is compiled from source.
 
-The first milestone is a command running on an extracted container root filesystem,
-with one vCPU, 1 GiB RAM, a serial console, and no network or TSI support.
-The launcher uses libkrun's C API. It is **not an OCI runtime**, so do not pass it
-to `podman --runtime`. Podman integration is a later milestone.
+The acceptance test runs the **unmodified `docker.io/library/nginx:stable` image**
+and fetches its welcome page from the host. It uses virtio-net through passt,
+with TSI disabled by libkrun's network-device configuration.
 
 ## Build RPMs in a Fedora container
-
-On an x86-64 Linux build host with Podman installed:
 
 ```sh
 bash tools/build-rpm.sh
 ```
 
-Use `CONTAINER_ENGINE=docker` to use Docker for the build, or
-`FEDORA_VERSION=44` to select the Fedora release explicitly. All compilation and
-RPM assembly happen in the Fedora container. KVM is needed for boot tests only.
+All compilation and RPM assembly happen inside Fedora 44. The build host needs
+Podman; `CONTAINER_ENGINE=docker` selects Docker instead. KVM is needed for tests.
+The checksum-verified upstream artifact is cached under `.cache/`.
 
-The build downloads and verifies the artifact pinned in [upstream.json](upstream.json).
-It produces a binary RPM under `dist/rpmbuild/RPMS/x86_64/` and an SRPM under
-`dist/rpmbuild/SRPMS/`. The SRPM contains the prebuilt kernel and the wrapper's
-source; it is deliberately a binary-kernel repackaging PoC.
+Binary RPMs are written to `dist/rpmbuild/RPMS/x86_64/`, and SRPMs to
+`dist/rpmbuild/SRPMS/`. The SRPM contains the prebuilt kernel and all wrapper source
+needed to rebuild offline inside the prepared Fedora builder.
 
-## Install and try on Fedora
+## Install and run nginx on Fedora
 
 ```sh
-sudo dnf install ./dist/rpmbuild/RPMS/x86_64/libkrunfw-asterinas-*.rpm
+sudo dnf install podman crun-krun passt
+sudo dnf install --allowerasing ./dist/rpmbuild/RPMS/x86_64/libkrunfw-asterinas-0.1.0-2.fc44.x86_64.rpm
 
-# Prepare a disposable root filesystem from an OCI image.
-mkdir rootfs
-container_id=$(podman create registry.fedoraproject.org/fedora:44)
-podman export "$container_id" | tar -xf - -C rootfs
-podman rm "$container_id"
+sudo podman network create --subnet 10.0.2.0/24 --gateway 10.0.2.2 asterinas
+sudo podman run -d --name asterinas-nginx --runtime /usr/bin/krun \
+    --security-opt seccomp=unconfined --pid host \
+    --annotation krun.cpus=1 --annotation krun.use_passt=1 \
+    --network asterinas --ip 10.0.2.15 -p 8080:8080 \
+    -v /usr/share/libkrunfw-asterinas/nginx.conf:/etc/nginx/conf.d/default.conf:ro,Z \
+    docker.io/library/nginx:stable
 
-sudo libkrunfw-asterinas-run "$PWD/rootfs" /bin/uname -a
+curl --noproxy '*' http://127.0.0.1:8080/
 ```
 
-The user running the launcher needs access to `/dev/kvm`. The RPM installs the
-alternate `libkrunfw.so.5` in `/usr/lib64/libkrunfw-asterinas/`; the launcher selects
-it for its own process. It does not replace the system's Linux firmware, alter
-Podman's default runtime, or install a container daemon.
+The RPM removes stock `libkrunfw`, installs its replacement in `/usr/lib64/`, and
+satisfies libkrun's firmware dependency. **Every consumer of the system firmware
+will then load Asterinas.** Restore Linux firmware with:
 
-Use a disposable root filesystem: the guest mounts it read-write through virtio-fs.
-The PoC supports non-interactive commands running as guest UID/GID 0. It does not
-provide the full OCI lifecycle, networking, multiport consoles, or SMP.
+```sh
+sudo dnf swap libkrunfw-asterinas libkrunfw
+```
 
-## Boot plumbing
+The supplied nginx config listens on `10.0.2.15:8080`. Asterinas currently has a
+fixed IPv4 address and rejects wildcard binds such as `0.0.0.0:80`; DHCP cannot
+change its address yet. This bind mount supplies runtime configuration while
+keeping the upstream image, executable, entrypoint, and CMD unchanged. Port 8080
+also avoids privileged-port restrictions on passt's forwarding sockets.
 
-The kernel's ELF load segments are flattened, including zero-filled memory.
-The wrapper chooses Asterinas's **Linux64** entry instead of its 32-bit ELF entry.
-A short boot stub supplies a single-CPU ACPI MADT, preserves libkrun's device and
-command arguments, and attaches an initramfs. Its guest bootstrap mounts libkrun's
-`/dev/root` virtio-fs share and executes the requested command.
+`--pid=host` works around crun 1.28 starting passt with an inconsistent `/proc`
+view. Guest processes still run inside the VM. This PoC uses one vCPU and 1 GiB
+RAM; rootless operation and Fedora host SELinux enforcement are not validated.
 
-Asterinas's current single-port virtio console does not complete libkrun's multiport
-handshake. The launcher therefore selects the existing libkrun serial-console API.
-It disables the implicit vsock device, so TSI kernel patches are not needed.
+## Current limitations
 
-The host observes the guest's `ASTERINAS_POC_EXIT=<status>` serial line, terminates
-the VM, and returns that status. This is a reserved PoC control line, not a secure
-or general-purpose process supervision protocol; workloads must not print it.
-Stock libkrun's virtio-fs exit-status ioctl and native guest shutdown are not used.
+Asterinas's virtio console supports one port; libkrun's default console requires
+multiport negotiation. Boot code leaves that device unbound, allowing stock krun
+to boot without a console. The guest bootstrap writes stdout/stderr to
+`/.asterinas.log` in the container's writable layer:
+
+```sh
+rootfs=$(sudo podman mount asterinas-nginx)
+sudo cat "$rootfs/.asterinas.log"
+sudo podman kill asterinas-nginx
+sudo podman rm asterinas-nginx
+```
+
+`podman logs`, interactive input, guest exec, graceful guest signal delivery, and
+guest exit-status propagation are not implemented. A completed guest command
+leaves the Podman VM running until killed. The PoC supports root guest commands,
+one container at the fixed network address, and IPv4. Nginx reports unavailable
+Linux AIO (`io_setup`) and continues using epoll and ordinary file I/O.
 
 ## Validation
 
-`make check` (inside the Fedora builder) verifies the firmware ABI, alignment,
-ELF segment preservation, boot entry, ACPI checksums, and initramfs headers.
-Boot testing uses KVM with Fedora's packaged libkrun and an extracted Fedora image.
-
-After building, run the installed-RPM tests in a disposable Fedora container:
-
 ```sh
 bash tools/smoke-test.sh
+bash tools/nginx-test.sh
 ```
 
-This test needs rootful Podman/Docker and KVM. It verifies a Fedora command,
-arguments containing spaces and quotes, and a nonzero exit status. Logs are saved
-in `build/smoke-*.log`. The privileged outer container is only the test environment;
-the RPM's launcher runs directly on a Fedora host after installation.
+Tests require rootful Podman/Docker and `/dev/kvm`. Both install the built RPM in
+a disposable Fedora container. The nginx test verifies that stock libkrunfw was
+removed, the packaged libkrun and krun files were not modified, a host HTTP request
+returns nginx's welcome page, and that request appears in the Asterinas guest log.
+Versions, image digest, response, and logs are saved under `build/nginx-*`.
 
-The wrapper and bootstrap are MIT licensed. The prebuilt kernel is MPL-2.0.
-The initramfs also contains the Fedora glibc and json-c runtime libraries needed by
-the bootstrap; the RPM includes their license notices. Artifact provenance is
-recorded in `upstream.json` and the generated `layout.json`.
+`KEEP_TEST_CONTAINER=1` leaves the successful nginx test serving on host port
+18080; `NGINX_TEST_PORT` changes that port. The outer privileged Fedora container
+provides the test environment on a non-Fedora build host. The inner Podman
+workload uses the normal capability set. These tests do not validate a native
+Fedora host's SELinux policy. An outdated Debian AppArmor profile for passt can
+also block a newer Fedora passt binary before the VM starts.
+
+`make check` inside the Fedora builder verifies the firmware ABI, alignment,
+unchanged ELF segments, Linux64 entry, ACPI checksums, and initramfs headers.
+The direct C API smoke test checks argument preservation and nonzero exit status.
+
+## Boot plumbing and direct launcher
+
+The kernel's ELF load segments are flattened, including zero-filled memory.
+A boot stub chooses Asterinas's Linux64 entry, supplies a single-CPU ACPI MADT,
+attaches an initramfs, and preserves libkrun's root-share and network devices.
+The bootstrap mounts `/dev/root` through virtio-fs and runs the OCI process config
+written by stock krun. It sends an initial packet so passt can learn the static
+guest's Ethernet address without a DHCP exchange.
+
+`libkrunfw-asterinas-run ROOT COMMAND [ARG...]` remains available for direct C API
+tests with an extracted, disposable root filesystem. It selects libkrun's serial
+console API and explicitly disables TSI/vsock. Set `ASTERINAS_PASST_SOCKET` to an
+existing passt stream socket to enable virtio-net; otherwise networking is off.
+The host launcher observes `ASTERINAS_POC_EXIT=<status>` on serial output, kills
+the VM, and returns that status. Workloads must not print that reserved control
+line; this is not a secure process-supervision protocol.
+
+The wrapper and bootstrap are MIT licensed; the prebuilt kernel is MPL-2.0.
+The initramfs contains Fedora glibc and json-c runtime libraries, with license
+notices included in the RPM. Provenance is recorded in `upstream.json` and the
+generated `layout.json`.

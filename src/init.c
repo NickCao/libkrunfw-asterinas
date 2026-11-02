@@ -1,12 +1,17 @@
 /* SPDX-License-Identifier: MIT */
 /* Minimal guest bootstrap: mount libkrun's root share and run the OCI command. */
 #define _GNU_SOURCE
+#include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <json-c/json.h>
+#include <net/if.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -50,7 +55,6 @@ int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
-    puts("Asterinas libkrunfw bootstrap");
     directory("/newroot");
     if (mount("/dev/root", "/newroot", "virtiofs", 0, NULL)) fail("mount /dev/root");
     if (chdir("/newroot") || chroot(".") || chdir("/")) fail("chroot");
@@ -59,6 +63,35 @@ int main(void)
     mount_fs("sysfs", "/sys", "sysfs");
     mount_fs("devpts", "/dev/pts", "devpts");
     mount_fs("tmpfs", "/dev/shm", "tmpfs");
+    const char *links[][2] = {
+        {"/proc/self/fd", "/dev/fd"}, {"/proc/self/fd/0", "/dev/stdin"},
+        {"/proc/self/fd/1", "/dev/stdout"}, {"/proc/self/fd/2", "/dev/stderr"},
+    };
+    for (size_t i = 0; i < sizeof(links) / sizeof(links[0]); ++i)
+        if (symlink(links[i][0], links[i][1]) && errno != EEXIST) fail(links[i][1]);
+    /* Stock krun exposes only a multiport console. The headless PoC writes
+     * diagnostics into the container's writable layer instead. */
+    if (access("/dev/ttyS0", F_OK)) {
+        int log = open("/.asterinas.log", O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+        if (log < 0) fail("open guest log");
+        if (dup2(log, STDOUT_FILENO) < 0 || dup2(log, STDERR_FILENO) < 0) fail("redirect guest log");
+        close(log);
+    }
+    puts("Asterinas libkrunfw bootstrap");
+    int network = socket(AF_INET, SOCK_DGRAM, 0);
+    struct ifreq iface = { .ifr_name = "eth0" };
+    if (network >= 0 && !ioctl(network, SIOCGIFADDR, &iface)) {
+        char address[INET_ADDRSTRLEN];
+        struct sockaddr_in *local = (struct sockaddr_in *)&iface.ifr_addr;
+        printf("Network eth0: %s\n", inet_ntop(AF_INET, &local->sin_addr, address, sizeof(address)));
+        /* A static guest has no DHCP exchange. Send one packet so passt can
+         * learn its Ethernet address before forwarding inbound connections. */
+        struct sockaddr_in gateway = { .sin_family = AF_INET, .sin_port = htons(9) };
+        inet_pton(AF_INET, "10.0.2.2", &gateway.sin_addr);
+        if (sendto(network, "", 1, 0, (struct sockaddr *)&gateway, sizeof(gateway)) < 0)
+            perror("announce guest network");
+    }
+    if (network >= 0) close(network);
 
     struct json_object *config = json_object_from_file("/.krun_config.json");
     struct json_object *process = config ? field(config, "process") : NULL;

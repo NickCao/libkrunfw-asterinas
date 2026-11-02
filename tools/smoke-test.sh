@@ -5,6 +5,8 @@ project_dir=$PWD
 engine=${CONTAINER_ENGINE:-podman}
 fedora=${FEDORA_VERSION:-44}
 builder="localhost/libkrunfw-asterinas-build:${fedora}"
+rpm=$(printf '%s\n' dist/rpmbuild/RPMS/x86_64/libkrunfw-asterinas-*.rpm | sort -V | tail -1)
+test -f "$rpm"
 mkdir -p .cache build
 rootfs=$(mktemp -d "$project_dir/.cache/smoke-rootfs.XXXXXX")
 container_id=
@@ -21,4 +23,4 @@ container_id=$("$engine" create "registry.fedoraproject.org/fedora:$fedora")
 container_id=
 "$engine" run --rm --name "$test_container" --privileged --network none \
     -v "$project_dir:/src:Z" -v "$rootfs:/rootfs:Z" "$builder" \
-    bash -c 'set -e; dnf -y --disablerepo="*" install /src/dist/rpmbuild/RPMS/x86_64/libkrunfw-asterinas-*.rpm; rpm -V libkrunfw-asterinas; python3 tools/smoke.py /rootfs'
+    bash -c 'set -e; dnf -y --disablerepo="*" install --allowerasing "/src/$1"; rpm -V libkrunfw-asterinas; python3 tools/smoke.py /rootfs' bash "$rpm"
