@@ -3,7 +3,7 @@
 %global vdso_commit 8af571775a3d3a1df3e84fc9709b9d6b160c771a
 Name:           libkrunfw-asterinas
 Version:        0.1.0
-Release:        8%{?dist}
+Release:        9%{?dist}
 Summary:        Experimental Asterinas guest payload for libkrun
 License:        MIT AND MPL-2.0
 URL:            https://github.com/NickCao/libkrunfw-asterinas
@@ -75,6 +75,10 @@ cp -a patches %{buildroot}%{_datadir}/%{name}/patches
 %{_datadir}/%{name}/
 
 %changelog
+* Mon Nov 02 2026 Nick Cao <nickcao@nichi.co> - 0.1.0-9
+- Remove the Podman CPU overrides after SMP checks with 4, 8 and 16 vCPUs
+- Use stock krun CPU selection in examples and runtime checks
+
 * Mon Nov 02 2026 Nick Cao <nickcao@nichi.co> - 0.1.0-8
 - Discover CPUs and I/O APICs from Intel MP tables when no ACPI MADT is available
 - Add a legacy reset fallback and honor the preferred serial console

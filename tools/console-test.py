@@ -15,7 +15,6 @@ runtime = [
     "--runtime", "/usr/bin/krun", "--security-opt", "seccomp=unconfined",
     "--pid", "host", "--cgroupns", "host", "--network", "none",
     "--log-driver=k8s-file",
-    "--annotation", "krun.cpus=1",
 ]
 image = "docker.io/library/nginx:stable"
 payload = bytes(range(256)) * 128

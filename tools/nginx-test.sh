@@ -47,7 +47,7 @@ podman --cgroup-manager=cgroupfs --storage-driver=vfs run -d \
     --name nginx-asterinas --runtime /usr/bin/krun \
     --log-driver=k8s-file \
     --security-opt seccomp=unconfined --pid host --cgroupns host \
-    --annotation krun.cpus=1 --annotation krun.use_passt=1 \
+    --annotation krun.use_passt=1 \
     --network asterinas --ip 10.0.2.15 -p 18080:8080 \
     -v /usr/share/libkrunfw-asterinas/nginx.conf:/etc/nginx/conf.d/default.conf:ro \
     docker.io/library/nginx:stable

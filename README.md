@@ -53,12 +53,12 @@ when a parent path contains `src/`. The RPM build script handles this.
 
 ```sh
 sudo dnf install podman crun-krun passt
-sudo dnf install --allowerasing ./dist/rpmbuild/RPMS/x86_64/libkrunfw-asterinas-0.1.0-8.fc44.x86_64.rpm
+sudo dnf install --allowerasing ./dist/rpmbuild/RPMS/x86_64/libkrunfw-asterinas-0.1.0-9.fc44.x86_64.rpm
 
 sudo podman network create --subnet 10.0.2.0/24 --gateway 10.0.2.2 asterinas
 sudo podman run -d --name asterinas-nginx --runtime /usr/bin/krun \
     --security-opt seccomp=unconfined --pid host \
-    --annotation krun.cpus=1 --annotation krun.use_passt=1 \
+    --annotation krun.use_passt=1 \
     --network asterinas --ip 10.0.2.15 -p 8080:8080 \
     -v /usr/share/libkrunfw-asterinas/nginx.conf:/etc/nginx/conf.d/default.conf:ro,Z \
     docker.io/library/nginx:stable
@@ -81,8 +81,11 @@ keeping the upstream image, executable, entrypoint, and CMD unchanged. Port 8080
 also avoids privileged-port restrictions on passt's forwarding sockets.
 
 `--pid=host` works around crun 1.28 starting passt with an inconsistent `/proc`
-view. Guest processes still run inside the VM. This PoC uses one vCPU and 1 GiB
-RAM; rootless operation and Fedora host SELinux enforcement are not validated.
+view. Guest processes still run inside the VM. CPU count follows stock krun's
+default: the host CPU affinity count, capped at 16 vCPUs. SMP smoke checks passed
+with 4, 8 and 16 vCPUs, including 8 vCPUs selected automatically on this host.
+RAM defaults to 1 GiB. Rootless operation and Fedora host SELinux enforcement
+are not validated.
 
 ## Console support and current limitations
 

@@ -33,7 +33,7 @@ try:
         outer + podman + [
             "run", "--name", name, "--runtime", "/usr/bin/krun",
             "--security-opt", "seccomp=unconfined", "--pid", "host", "--cgroupns", "host",
-            "--network", "none", "--log-driver=k8s-file", "--annotation", "krun.cpus=1",
+            "--network", "none", "--log-driver=k8s-file",
             "docker.io/library/nginx:stable", "/bin/sh", "-c", command,
         ],
         capture_output=True, timeout=60,
