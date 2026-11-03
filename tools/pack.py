@@ -3,7 +3,6 @@
 import argparse
 import json
 from pathlib import Path
-import stat
 import struct
 import subprocess
 
@@ -89,43 +88,10 @@ def acpi(address):
     return rsdp + xsdt + madt + fadt
 
 
-def cpio_entry(name, mode, data=b"", major=0, minor=0):
-    name = name.encode() + b"\0"
-    fields = [0, mode, 0, 0, 1, 0, len(data), 0, 0, major, minor, len(name), 0]
-    header = b"070701" + b"".join(f"{value:08x}".encode() for value in fields)
-    result = header + name
-    result += bytes(align(len(result), 4) - len(result))
-    result += data
-    return result + bytes(align(len(data), 4) - len(data))
-
-
-def initramfs(init_path):
-    # Package the helper's Fedora runtime libraries in the bootstrap initramfs.
-    # The actual container executable later uses the container's own libraries.
-    libraries = set()
-    for line in subprocess.check_output(["ldd", str(init_path)], text=True).splitlines():
-        for item in line.split():
-            if item.startswith("/"):
-                libraries.add(Path(item))
-    result = (cpio_entry("dev", stat.S_IFDIR | 0o755)
-            + cpio_entry("dev/console", stat.S_IFCHR | 0o600, major=5, minor=1)
-            + cpio_entry("newroot", stat.S_IFDIR | 0o755)
-            + cpio_entry("init", stat.S_IFREG | 0o755, init_path.read_bytes()))
-    directories = set()
-    for library in sorted(libraries):
-        for parent in reversed(library.parents):
-            if parent != Path("/") and parent not in directories:
-                result += cpio_entry(str(parent).lstrip("/"), stat.S_IFDIR | 0o755)
-                directories.add(parent)
-        result += cpio_entry(str(library).lstrip("/"), stat.S_IFREG | 0o755, library.read_bytes())
-    return result + cpio_entry("TRAILER!!!", 0)
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("kernel", type=Path)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--init", type=Path, help="include a bootstrap initramfs; omit for direct root boot")
     args = parser.parse_args()
     base, entry, image = flatten_elf(args.kernel.read_bytes())
     args.output.mkdir(parents=True, exist_ok=True)
@@ -133,13 +99,11 @@ def main():
     acpi_offset = bootstrap_offset + 4096
     cmdline_offset = acpi_offset + 4096
     mmio_pd_offset = cmdline_offset + 8192
-    initrd_offset = mmio_pd_offset + 4096
-    initrd = initramfs(args.init) if args.init else b""
-    size = align(initrd_offset + len(initrd))
+    size = align(mmio_pd_offset + 4096)
     defines = {
         "IMAGE_BASE": base, "IMAGE_SIZE": size,
         "KERNEL_ENTRY": entry, "RSDP_ADDR": base + acpi_offset,
-        "INITRD_ADDR": base + initrd_offset if initrd else 0, "INITRD_SIZE": len(initrd),
+        "INITRD_ADDR": 0, "INITRD_SIZE": 0,
         "CMDLINE_ADDR": base + cmdline_offset,
         "MMIO_PD_ADDR": base + mmio_pd_offset,
         "BOOT_DATA_BASE": base + bootstrap_offset,
@@ -157,7 +121,6 @@ def main():
     image[bootstrap_offset:bootstrap_offset + len(bootstrap)] = bootstrap
     tables = acpi(base + acpi_offset)
     image[acpi_offset:acpi_offset + len(tables)] = tables
-    image[initrd_offset:initrd_offset + len(initrd)] = initrd
     (args.output / "firmware.bin").write_bytes(image)
     defines["IMAGE_ENTRY"] = base + bootstrap_offset
     (args.output / "layout.h").write_text("".join(f"#define {k} {v}UL\n" for k, v in defines.items()))

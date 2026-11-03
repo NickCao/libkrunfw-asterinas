@@ -72,9 +72,11 @@ void boot_prepare(unsigned char *params)
     for (const char *s = input; s < end;) {
         const char *token = s;
         while (s < end && *s != ' ') ++s;
-        /* Asterinas has no Linux TSI socket hooks. Do not advertise them to
-         * libkrun's init, including on VMs without a virtio-net device. */
-        if (!(s - token == 10 && starts(token, s, "tsi_hijack")))
+        /* Keep unsupported TSI and DHCP configuration out of stock guest init.
+         * Asterinas currently configures virtio-net with a fixed IPv4 address. */
+        int skip = (s - token == 10 && starts(token, s, "tsi_hijack"))
+                || starts(token, s, "KRUN_DHCP=");
+        if (!skip)
             while (token < s) *output++ = *token++;
         if (s < end) *output++ = *s++;
     }

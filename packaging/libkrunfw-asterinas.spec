@@ -3,9 +3,9 @@
 %global vdso_commit 8af571775a3d3a1df3e84fc9709b9d6b160c771a
 Name:           libkrunfw-asterinas
 Version:        0.1.0
-Release:        6%{?dist}
+Release:        7%{?dist}
 Summary:        Experimental Asterinas guest payload for libkrun
-License:        MIT AND MPL-2.0 AND LGPL-2.1-or-later
+License:        MIT AND MPL-2.0
 URL:            https://github.com/NickCao/libkrunfw-asterinas
 Source0:        %{name}-%{version}.tar.gz
 Source1:        asterinas-%{asterinas_commit}.tar.gz
@@ -36,7 +36,8 @@ Provides:       bundled(asterinas) = 0.19.0
 
 %description
 A source-built Asterinas kernel wrapped in libkrunfw ABI 5, with minimal boot
-data and a guest bootstrap. Includes a one-vCPU C API launcher
+data. The kernel mounts the virtiofs root directly and starts stock libkrun's
+guest init without an initramfs. Includes a one-vCPU C API launcher
 for testing an extracted container filesystem with Fedora's stock libkrun.
 Replaces the system libkrunfw. This is an experimental payload for the
 unmodified Fedora libkrun and krun packages.
@@ -46,21 +47,16 @@ unmodified Fedora libkrun and krun packages.
 python3 tools/fetch-sources.py --cache %{_sourcedir} --offline
 tar -xf %{SOURCE1}
 tar -xf %{SOURCE2}
-cp -a /usr/share/licenses/glibc licenses/guest-glibc
 
 %build
 bash tools/build-kernel.sh "$PWD/asterinas-%{asterinas_commit}" "$PWD/linux_vdso-%{vdso_commit}"
 %make_build CFLAGS="%{build_cflags}"
-%make_build BOOT_MODE=rootfs CFLAGS="%{build_cflags}"
 
 %check
 %make_build check
-%make_build BOOT_MODE=rootfs check
 
 %install
 install -Dpm0755 build/libkrunfw.so.5 %{buildroot}%{_libdir}/libkrunfw.so.5
-install -Dpm0755 build/rootfs/libkrunfw.so.5 %{buildroot}%{_libdir}/%{name}/rootfs/libkrunfw.so.5
-install -Dpm0644 build/rootfs/payload/layout.json %{buildroot}%{_datadir}/%{name}/rootfs-layout.json
 install -Dpm0755 build/run %{buildroot}%{_libexecdir}/%{name}/run
 install -Dpm0755 bin/libkrunfw-asterinas-run %{buildroot}%{_bindir}/libkrunfw-asterinas-run
 install -Dpm0644 build/payload/layout.json %{buildroot}%{_datadir}/%{name}/layout.json
@@ -71,15 +67,18 @@ install -Dpm0644 examples/nginx.conf %{buildroot}%{_datadir}/%{name}/nginx.conf
 cp -a patches %{buildroot}%{_datadir}/%{name}/patches
 
 %files
-%license LICENSE licenses/ASTERINAS-MPL-2.0 licenses/guest-glibc
+%license LICENSE licenses/ASTERINAS-MPL-2.0
 %doc README.md
 %{_bindir}/libkrunfw-asterinas-run
 %{_libexecdir}/%{name}/
 %{_libdir}/libkrunfw.so.5
-%{_libdir}/%{name}/
 %{_datadir}/%{name}/
 
 %changelog
+* Mon Nov 02 2026 Nick Cao <nickcao@nichi.co> - 0.1.0-7
+- Make direct virtiofs root boot the only firmware path and remove the custom init
+- Prepare standard device links and resolve the static gateway during kernel boot
+
 * Mon Nov 02 2026 Nick Cao <nickcao@nichi.co> - 0.1.0-6
 - Support kernel-mounted virtiofs root filesystems and the /dev/root fallback tag
 - Include direct root boot firmware without the bootstrap initramfs

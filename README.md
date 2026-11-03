@@ -53,7 +53,7 @@ when a parent path contains `src/`. The RPM build script handles this.
 
 ```sh
 sudo dnf install podman crun-krun passt
-sudo dnf install --allowerasing ./dist/rpmbuild/RPMS/x86_64/libkrunfw-asterinas-0.1.0-6.fc44.x86_64.rpm
+sudo dnf install --allowerasing ./dist/rpmbuild/RPMS/x86_64/libkrunfw-asterinas-0.1.0-7.fc44.x86_64.rpm
 
 sudo podman network create --subnet 10.0.2.0/24 --gateway 10.0.2.2 asterinas
 sudo podman run -d --name asterinas-nginx --runtime /usr/bin/krun \
@@ -92,9 +92,9 @@ readiness messages, and gives each port independent receive/transmit queues.
 carry krun's named `krun-stdin`, `krun-stdout`, and `krun-stderr` streams without
 terminal processing. Standard port names are exposed through
 `/sys/class/virtio-ports/vport0pN/name`. Fedora libkrun's unmodified `/init.krun`
-selects the streams and launches the OCI command. Our small initramfs bootstrap
-mounts the root share, supplies standard `/dev/std*` links, prepares static
-networking, and hands PID 1 to that injected binary.
+selects the streams and launches the OCI command. The kernel mounts the virtiofs
+root and devtmpfs, supplies standard `/dev/std*` links, and starts that injected
+binary directly as PID 1. There is no custom guest init or initramfs.
 
 Container output is available through normal Podman logging:
 
@@ -150,22 +150,25 @@ console input and initial terminal dimensions, and Podman exit status 7. Logs ar
 `build/console-*`.
 
 `make check` inside the Fedora builder verifies the firmware ABI, alignment,
-unchanged ELF segments, Linux64 entry, ACPI checksums, and initramfs headers.
+unchanged ELF segments, Linux64 entry, ACPI checksums, and the absence of an initramfs.
 The direct C API smoke test checks argument preservation and nonzero exit status.
 
 ## Boot plumbing and direct launcher
 
 The kernel's ELF load segments are flattened, including zero-filled memory.
 A boot stub chooses Asterinas's Linux64 entry, supplies a single-CPU ACPI MADT
-and a FADT with libkrun's emulated reset register,
-attaches an initramfs, and preserves libkrun's root-share and network devices.
-The bootstrap mounts `/dev/root` through virtio-fs and executes the unmodified
-`/init.krun` injected by stock libkrun. That init handles the OCI process config,
-stdio redirection, process supervision and exit reporting. The bootstrap sends
-an initial packet so passt can learn the static guest's Ethernet address and
-disables DHCP while Asterinas's network configuration remains fixed.
-The boot shim removes the Linux-only TSI flag so the upstream init leaves
-socket hijacking disabled on console-only VMs too.
+and a FADT with libkrun's emulated reset register, and preserves libkrun's
+root-share and network devices. The kernel mounts the `/dev/root` virtiofs tag
+as its root filesystem and executes the unmodified `/init.krun` injected by
+stock libkrun. That init handles the OCI process config, stdio redirection,
+process supervision and exit reporting.
+
+The kernel supplies `/dev/fd` and `/dev/std*` links before starting init. Ethernet
+interface setup sends an ARP request for the configured gateway, allowing passt
+to learn the static guest's Ethernet address before an inbound connection.
+The boot stub removes the Linux-only TSI flag and `KRUN_DHCP` setting while
+Asterinas's network configuration remains fixed. No guest bootstrap executable
+or guest glibc libraries are embedded in the firmware.
 
 `libkrunfw-asterinas-run ROOT COMMAND [ARG...]` remains available for direct C API
 tests with an extracted, disposable root filesystem. It selects libkrun's serial
@@ -174,14 +177,13 @@ existing passt stream socket to enable virtio-net; otherwise networking is off.
 The host launcher relays serial output and returns the VMM process's exit code.
 It uses the same upstream init and exit protocol as the Podman path.
 
-The wrapper and bootstrap are MIT licensed; the Asterinas kernel is MPL-2.0.
-The initramfs contains Fedora glibc runtime libraries, with license
-notices included in the RPM. Provenance is recorded in `upstream.json` and the
-generated `kernel-build.json`, `kernel-Cargo.lock`, and `layout.json`.
+The wrapper and boot stub are MIT licensed; the Asterinas kernel is MPL-2.0.
+Provenance is recorded in `upstream.json` and the generated `kernel-build.json`,
+`kernel-Cargo.lock`, and `layout.json`.
 
 ## Direct virtiofs root boot
 
-The kernel also supports booting directly from virtiofs without an initramfs.
+The firmware boots directly from virtiofs without an initramfs.
 With `rootfstype=virtiofs`, `root=TAG` selects a virtiofs tag rather than a block
 device. If `root` is omitted, the source defaults to `/dev/root`, matching Linux's
 root mount fallback and stock krun's default export tag. The kernel mounts the
@@ -189,22 +191,16 @@ share as `/`, mounts devtmpfs, and starts the program selected by `init`, normal
 libkrun's injected `/init.krun`. Explicit tags must exist; `ro` and `rw` control
 root write access. Ext2 root boot and initramfs init selection remain supported.
 
-The RPM includes this firmware under `/usr/lib64/libkrunfw-asterinas/rootfs/`.
-For a console-only command using stock krun:
+This is the default `/usr/lib64/libkrunfw.so.5` installed by the RPM. For a
+console-only command using stock krun:
 
 ```sh
-sudo env LD_LIBRARY_PATH=/usr/lib64/libkrunfw-asterinas/rootfs \
-    podman run --rm --runtime /usr/bin/krun --network none \
+sudo podman run --rm --runtime /usr/bin/krun --network none \
     --security-opt seccomp=unconfined --pid host \
     docker.io/library/nginx:stable /bin/sh -c 'cat /proc/mounts; exit 7'
 ```
 
-The default firmware retains the initramfs bootstrap for the current static
-networking and `/dev/std*` setup. Direct root boot runs stock init without those
-workarounds; use the default firmware for the nginx HTTP example above.
-
-`make BOOT_MODE=rootfs` inside the Fedora builder produces the direct root
-firmware under `build/rootfs/`, sharing the kernel built under `build/`.
 `python3 tools/rootfs-test.py CONTAINER` checks the RPM in a retained Fedora test
-container: no initramfs, root mounted from the default tag, stock init, and exit
+container: the default firmware has no initramfs, mounts root from the default
+tag, supplies functioning stdio links, starts stock init, and returns exit
 status 7 through Podman. Its output is saved in `build/rootfs-test.log`.

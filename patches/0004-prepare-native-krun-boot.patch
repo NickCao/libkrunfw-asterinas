@@ -1,0 +1,87 @@
+--- a/kernel/core/src/fs/mod.rs
++++ b/kernel/core/src/fs/mod.rs
+@@ -54,6 +54,8 @@
+                 ctx,
+             )
+             .unwrap();
++        create_standard_dev_links(&path_resolver)
++            .expect("failed to create standard /dev links for rootfs init");
+     }
+ 
+     // Initialize the file table for the first process.
+@@ -100,6 +102,25 @@
+         .unwrap();
+ }
+ 
++fn create_standard_dev_links(path_resolver: &PathResolver) -> Result<()> {
++    // A minimal rootfs init may not supply these aliases itself. Populate the
++    // mounted devtmpfs before starting it, without an initramfs setup program.
++    let dev = path_resolver.lookup(&FsPath::try_from("/dev")?)?;
++    for (name, target) in [
++        ("fd", "/proc/self/fd"),
++        ("stdin", "/proc/self/fd/0"),
++        ("stdout", "/proc/self/fd/1"),
++        ("stderr", "/proc/self/fd/2"),
++    ] {
++        match dev.new_symlink_child(name, target, mkmod!(a+rwx)) {
++            Ok(_) => {}
++            Err(error) if error.error() == Errno::EEXIST => {}
++            Err(error) => return Err(error),
++        }
++    }
++    Ok(())
++}
++
+ fn lookup_or_create_dev(path_resolver: &PathResolver) -> Result<Path> {
+     match path_resolver.lookup(&FsPath::try_from("/dev")?) {
+         Err(error) if error.error() == Errno::ENOENT => {
+--- a/kernel/libs/aster-bigtcp/src/iface/phy/ether.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/phy/ether.rs
+@@ -13,7 +13,7 @@
+ };
+ 
+ use crate::{
+-    device::{AnyNetworkDevice, WithDevice, new_interface},
++    device::{AnyNetworkDevice, NetError, WithDevice, new_interface},
+     ext::Ext,
+     iface::{
+         Iface, InterfaceFlags, InterfaceName,
+@@ -60,11 +60,37 @@
+ 
+         let common = IfaceCommon::new(name, InterfaceType::ETHER, flags, interface, sched_poll);
+ 
+-        Arc::new(Self {
++        let iface = Arc::new(Self {
+             driver,
+             common,
+             ether_addr,
+             arp_table: SpinLock::new(BTreeMap::new()),
++        });
++
++        // Resolve the configured gateway before the first application packet.
++        // This also lets Ethernet bridges learn the interface's MAC address
++        // when a statically configured guest only accepts inbound connections.
++        if let Err(error) = iface.request_neighbor(ip_cidr.address(), gateway) {
++            ostd::warn!("initial gateway ARP request failed: {:?}", error);
++        }
++        iface
++    }
++
++    fn request_neighbor(&self, source: Ipv4Address, target: Ipv4Address) -> Result<(), NetError> {
++        let request = ArpRepr::EthernetIpv4 {
++            operation: ArpOperation::Request,
++            source_hardware_addr: self.ether_addr,
++            source_protocol_addr: source,
++            target_hardware_addr: EthernetAddress::BROADCAST,
++            target_protocol_addr: target,
++        };
++        let buffer = D::Device::alloc_tx_buffer(0).map_err(|_| NetError::NoMemory)?;
++        // `emit_arp` supports the Ethernet/IPv4 representation constructed above.
++        let packet = Self::emit_arp(&request, buffer).unwrap();
++        self.driver.with(|device| {
++            let result = device.send(packet);
++            device.notify_poll_end();
++            result
+         })
+     }
+ }

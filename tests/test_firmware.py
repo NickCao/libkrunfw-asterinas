@@ -38,15 +38,6 @@ class BootDataTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             pack.flatten_elf(b"not a kernel")
 
-    def test_cpio_alignment_and_file_data(self):
-        entry = pack.cpio_entry("init", 0o100755, b"test")
-        self.assertEqual(entry[:6], b"070701")
-        self.assertEqual(len(entry) % 4, 0)
-        name_length = int(entry[94:102], 16)
-        self.assertEqual(entry[110:110 + name_length], b"init\0")
-        self.assertEqual(entry[pack.align(110 + name_length, 4):], b"test")
-
-
 class FirmwareABITests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -77,14 +68,9 @@ class FirmwareABITests(unittest.TestCase):
         self.assertEqual(self.layout["BOOT_DATA_BASE"], base + len(image))
         self.assertEqual(self.layout["BOOT_DATA_SIZE"], self.size.value - len(image))
 
-    def test_initramfs_is_present_or_disabled(self):
-        address, size = self.layout["INITRD_ADDR"], self.layout["INITRD_SIZE"]
-        if size:
-            offset = address - self.base.value
-            self.assertEqual(ctypes.string_at(self.pointer + offset, 6), b"070701")
-            self.assertLessEqual(offset + size, self.size.value)
-        else:
-            self.assertEqual(address, 0)
+    def test_firmware_has_no_initramfs(self):
+        self.assertEqual(self.layout["INITRD_ADDR"], 0)
+        self.assertEqual(self.layout["INITRD_SIZE"], 0)
 
 
 if __name__ == "__main__":

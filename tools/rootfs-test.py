@@ -10,16 +10,20 @@ engine = os.environ.get("CONTAINER_ENGINE", "podman")
 container = sys.argv[1]
 podman = ["podman", "--cgroup-manager=cgroupfs", "--storage-driver=vfs"]
 name = f"virtiofs-root-{os.getpid()}"
-firmware = "/usr/lib64/libkrunfw-asterinas/rootfs"
-outer = [engine, "exec", "-e", f"LD_LIBRARY_PATH={firmware}", container]
+outer = [engine, "exec", container]
 layout = subprocess.check_output(
-    [engine, "exec", container, "cat", "/usr/share/libkrunfw-asterinas/rootfs-layout.json"],
+    [engine, "exec", container, "cat", "/usr/share/libkrunfw-asterinas/layout.json"],
     text=True,
 )
 assert json.loads(layout)["INITRD_SIZE"] == 0, "firmware still contains an initramfs"
 command = r'''
-case " $(cat /proc/cmdline) " in *" root="*) exit 90;; esac
+case " $(cat /proc/cmdline) " in *" root="*|*"KRUN_DHCP="*|*"tsi_hijack"*) exit 90;; esac
 awk '$2 == "/" && $3 == "virtiofs" { found=1 } END { exit !found }' /proc/mounts || exit 91
+for stream in stdin stdout stderr; do
+    test -L "/dev/$stream" || exit 92
+done
+printf 'STDOUT_LINK_OK\n' > /dev/stdout
+printf 'STDERR_LINK_OK\n' > /dev/stderr
 printf 'VIRTIOFS_ROOT_OK\n'
 exit 7
 '''
@@ -39,10 +43,12 @@ try:
         b"rootfs is ready (mounted from /dev/root)",
         b"running /init.krun as the init process",
         b"VIRTIOFS_ROOT_OK",
+        b"STDOUT_LINK_OK",
+        b"STDERR_LINK_OK",
     ):
         assert marker in output, f"missing {marker!r}; see build/rootfs-test.log"
     assert result.returncode == 7, f"expected guest exit 7, got {result.returncode}"
-    print("PASS: no initramfs, default /dev/root virtiofs tag, stock init and Podman exit 7")
+    print("PASS: default firmware, no initramfs, virtiofs root, stdio links, stock init and Podman exit 7")
 finally:
     subprocess.run(
         [engine, "exec", container] + podman + ["rm", "-f", name],
