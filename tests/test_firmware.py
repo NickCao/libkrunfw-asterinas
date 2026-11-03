@@ -14,26 +14,6 @@ import pack
 
 
 class BootDataTests(unittest.TestCase):
-    def test_acpi_checksums_and_addresses(self):
-        base = 0x9601000
-        data = pack.acpi(base)
-        self.assertEqual(data[:8], b"RSD PTR ")
-        self.assertEqual(sum(data[:20]) % 256, 0)
-        self.assertEqual(sum(data[:36]) % 256, 0)
-        self.assertEqual(struct.unpack_from("<Q", data, 24)[0], base + 36)
-        self.assertEqual(data[36:40], b"XSDT")
-        xsdt_length = struct.unpack_from("<I", data, 40)[0]
-        self.assertEqual(sum(data[36:36 + xsdt_length]) % 256, 0)
-        madt, fadt = (pointer - base for pointer in struct.unpack_from("<QQ", data, 72))
-        self.assertEqual(madt, 36 + xsdt_length)
-        self.assertEqual(data[madt:madt + 4], b"APIC")
-        self.assertEqual(sum(data[madt:fadt]) % 256, 0)
-        self.assertEqual(struct.unpack_from("<I", data, madt + 36)[0], 0xfee00000)
-        self.assertEqual(data[fadt:fadt + 4], b"FACP")
-        self.assertEqual(sum(data[fadt:]) % 256, 0)
-        self.assertEqual(struct.unpack_from("<BBBBQ", data, fadt + 116), (1, 8, 0, 1, 0x64))
-        self.assertEqual(data[fadt + 128], 0xfe)
-
     def test_rejects_wrong_elf_format(self):
         with self.assertRaises(ValueError):
             pack.flatten_elf(b"not a kernel")
@@ -65,12 +45,13 @@ class FirmwareABITests(unittest.TestCase):
         self.assertEqual(entry, self.layout["KERNEL_ENTRY"])
         self.assertNotEqual(entry, struct.unpack_from("<Q", KERNEL.read_bytes(), 24)[0])
         self.assertEqual(ctypes.string_at(self.pointer, len(image)), image)
-        self.assertEqual(self.layout["BOOT_DATA_BASE"], base + len(image))
-        self.assertEqual(self.layout["BOOT_DATA_SIZE"], self.size.value - len(image))
+        self.assertEqual(self.entry.value, entry)
+        self.assertEqual(self.size.value, len(image))
 
     def test_firmware_has_no_initramfs(self):
         self.assertEqual(self.layout["INITRD_ADDR"], 0)
         self.assertEqual(self.layout["INITRD_SIZE"], 0)
+        self.assertNotIn("RSDP_ADDR", self.layout)
 
 
 if __name__ == "__main__":

@@ -53,7 +53,7 @@ when a parent path contains `src/`. The RPM build script handles this.
 
 ```sh
 sudo dnf install podman crun-krun passt
-sudo dnf install --allowerasing ./dist/rpmbuild/RPMS/x86_64/libkrunfw-asterinas-0.1.0-7.fc44.x86_64.rpm
+sudo dnf install --allowerasing ./dist/rpmbuild/RPMS/x86_64/libkrunfw-asterinas-0.1.0-8.fc44.x86_64.rpm
 
 sudo podman network create --subnet 10.0.2.0/24 --gateway 10.0.2.2 asterinas
 sudo podman run -d --name asterinas-nginx --runtime /usr/bin/krun \
@@ -112,9 +112,9 @@ disabled. The PoC supports one console and up to 32 ports per device, with ports
 opened during discovery. General hotplug/reopen handling is not implemented.
 
 Workload exit status follows libkrun's normal protocol: its init sends ioctl
-`0x7602` through the virtiofs root, syncs, and resets the VM using the ACPI reset
-register. The VMM exits with that status, so foreground `podman run` returns the
-guest's code and the container stops normally.
+`0x7602` through the virtiofs root, syncs, and resets the VM through the x86 legacy
+reset port. The VMM exits with that status, so foreground `podman run` returns
+the guest's code and the container stops normally.
 
 `podman exec` remains unsupported by the stock krun versions used here
 ([upstream issue](https://github.com/containers/crun/issues/2090)). Graceful
@@ -150,15 +150,20 @@ console input and initial terminal dimensions, and Podman exit status 7. Logs ar
 `build/console-*`.
 
 `make check` inside the Fedora builder verifies the firmware ABI, alignment,
-unchanged ELF segments, Linux64 entry, ACPI checksums, and the absence of an initramfs.
+unchanged ELF segments, direct Linux64 entry, and the absence of an initramfs or appended boot shim.
 The direct C API smoke test checks argument preservation and nonzero exit status.
 
 ## Boot plumbing and direct launcher
 
 The kernel's ELF load segments are flattened, including zero-filled memory.
-A boot stub chooses Asterinas's Linux64 entry, supplies a single-CPU ACPI MADT
-and a FADT with libkrun's emulated reset register, and preserves libkrun's
-root-share and network devices. The kernel mounts the `/dev/root` virtiofs tag
+The library reports Asterinas's native Linux64 entry directly to libkrun. There
+is no guest boot shim or generated ACPI data. Asterinas uses ACPI topology when
+available and falls back to Intel MP tables for CPU discovery and I/O APIC
+routing on BIOS-compatible boot paths, including stock libkrun. MP table
+checksums, entry bounds and lengths are validated before use, and table memory
+is reserved before frame allocation. Explicit MP 1.1/1.4 base tables in low
+memory and system BIOS ROM are supported; implicit default configurations and
+extended routing tables are not implemented. The kernel mounts the `/dev/root` virtiofs tag
 as its root filesystem and executes the unmodified `/init.krun` injected by
 stock libkrun. That init handles the OCI process config, stdio redirection,
 process supervision and exit reporting.
@@ -166,9 +171,11 @@ process supervision and exit reporting.
 The kernel supplies `/dev/fd` and `/dev/std*` links before starting init. Ethernet
 interface setup sends an ARP request for the configured gateway, allowing passt
 to learn the static guest's Ethernet address before an inbound connection.
-The boot stub removes the Linux-only TSI flag and `KRUN_DHCP` setting while
-Asterinas's network configuration remains fixed. No guest bootstrap executable
-or guest glibc libraries are embedded in the firmware.
+The boot command line is passed through unchanged. DHCP configuration and TSI
+remain unsupported; stock init may print warnings when its optional setup fails
+and then continues with the workload. Networking still uses Asterinas's fixed
+IPv4 configuration. No guest bootstrap executable or guest glibc libraries are
+embedded in the firmware.
 
 `libkrunfw-asterinas-run ROOT COMMAND [ARG...]` remains available for direct C API
 tests with an extracted, disposable root filesystem. It selects libkrun's serial
@@ -177,7 +184,7 @@ existing passt stream socket to enable virtio-net; otherwise networking is off.
 The host launcher relays serial output and returns the VMM process's exit code.
 It uses the same upstream init and exit protocol as the Podman path.
 
-The wrapper and boot stub are MIT licensed; the Asterinas kernel is MPL-2.0.
+The wrapper is MIT licensed; the Asterinas kernel is MPL-2.0.
 Provenance is recorded in `upstream.json` and the generated `kernel-build.json`,
 `kernel-Cargo.lock`, and `layout.json`.
 

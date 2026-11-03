@@ -1,10 +1,9 @@
 #!/usr/bin/python3
-"""Flatten Asterinas's ELF and append the boot data needed by stock libkrun."""
+"""Flatten Asterinas's ELF for direct entry by stock libkrun."""
 import argparse
 import json
 from pathlib import Path
 import struct
-import subprocess
 
 ALIGNMENT = 65536
 
@@ -58,36 +57,6 @@ def flatten_elf(data):
     return base, entry, result
 
 
-def checksum(data, offset):
-    data[offset] = (-sum(data)) & 255
-    return bytes(data)
-
-
-def table(signature, body, revision=1):
-    header = struct.pack("<4sIBB6s8sI4sI", signature, 36 + len(body), revision, 0, b"ASTER ", b"KRUNPOC ", 1, b"ASTR", 1)
-    return checksum(bytearray(header + body), 9)
-
-
-def acpi(address):
-    # A single CPU, standard KVM APIC addresses and libkrun's emulated reset.
-    madt_address = address + 88
-    madt = table(b"APIC", struct.pack("<II", 0xfee00000, 1)
-                 + struct.pack("<BBBBI", 0, 8, 0, 0, 1)
-                 + struct.pack("<BBBBII", 1, 12, 0, 0, 0xfec00000, 0))
-    fadt_address = madt_address + len(madt)
-    # ACPI 6.x FADT, section 5.2.9: RESET_REG is a Generic Address Structure.
-    fadt_body = bytearray(276 - 36)
-    struct.pack_into("<I", fadt_body, 112 - 36, 1 << 10)  # RESET_REG_SUP
-    struct.pack_into("<BBBBQ", fadt_body, 116 - 36, 1, 8, 0, 1, 0x64)
-    fadt_body[128 - 36] = 0xfe
-    fadt = table(b"FACP", fadt_body, revision=6)
-    xsdt = table(b"XSDT", struct.pack("<QQ", madt_address, fadt_address))
-    rsdp = bytearray(struct.pack("<8sB6sBIIQB3s", b"RSD PTR ", 0, b"ASTER ", 2, 0, 36, address + 36, 0, b"\0" * 3))
-    rsdp[8] = (-sum(rsdp[:20])) & 255
-    rsdp = checksum(rsdp, 32)
-    return rsdp + xsdt + madt + fadt
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("kernel", type=Path)
@@ -95,34 +64,12 @@ def main():
     args = parser.parse_args()
     base, entry, image = flatten_elf(args.kernel.read_bytes())
     args.output.mkdir(parents=True, exist_ok=True)
-    bootstrap_offset = len(image)
-    acpi_offset = bootstrap_offset + 4096
-    cmdline_offset = acpi_offset + 4096
-    mmio_pd_offset = cmdline_offset + 8192
-    size = align(mmio_pd_offset + 4096)
     defines = {
-        "IMAGE_BASE": base, "IMAGE_SIZE": size,
-        "KERNEL_ENTRY": entry, "RSDP_ADDR": base + acpi_offset,
+        "IMAGE_BASE": base, "IMAGE_SIZE": len(image),
+        "KERNEL_ENTRY": entry, "IMAGE_ENTRY": entry,
         "INITRD_ADDR": 0, "INITRD_SIZE": 0,
-        "CMDLINE_ADDR": base + cmdline_offset,
-        "MMIO_PD_ADDR": base + mmio_pd_offset,
-        "BOOT_DATA_BASE": base + bootstrap_offset,
-        "BOOT_DATA_SIZE": size - bootstrap_offset,
     }
-    root = Path(__file__).resolve().parents[1]
-    (args.output / "layout.h").write_text("".join(f"#define {k} {v}UL\n" for k, v in defines.items()))
-    subprocess.run(["gcc", "-c", "-nostdlib", *[f"-D{k}={v}" for k, v in defines.items()], str(root / "src/entry.S"), "-o", str(args.output / "entry.o")], check=True)
-    subprocess.run(["gcc", "-c", "-Os", "-ffreestanding", "-fno-pie", "-fno-stack-protector", "-fno-asynchronous-unwind-tables", "-fno-tree-loop-distribute-patterns", "-mno-red-zone", "-mgeneral-regs-only", "-I" + str(args.output), str(root / "src/boot.c"), "-o", str(args.output / "boot.o")], check=True)
-    subprocess.run(["ld", "--defsym=BOOT_BASE=" + str(base + bootstrap_offset), "-T", str(root / "src/boot.ld"), "--oformat=binary", str(args.output / "entry.o"), str(args.output / "boot.o"), "-o", str(args.output / "entry.bin")], check=True)
-    bootstrap = (args.output / "entry.bin").read_bytes()
-    if len(bootstrap) > 4096:
-        raise ValueError("Boot code exceeds reserved space")
-    image += bytes(size - len(image))
-    image[bootstrap_offset:bootstrap_offset + len(bootstrap)] = bootstrap
-    tables = acpi(base + acpi_offset)
-    image[acpi_offset:acpi_offset + len(tables)] = tables
     (args.output / "firmware.bin").write_bytes(image)
-    defines["IMAGE_ENTRY"] = base + bootstrap_offset
     (args.output / "layout.h").write_text("".join(f"#define {k} {v}UL\n" for k, v in defines.items()))
     (args.output / "layout.json").write_text(json.dumps(defines, indent=2) + "\n")
     (args.output / "image.S").write_text('.data\n.balign 65536\n.global firmware_image\n.hidden firmware_image\nfirmware_image:\n.incbin "' + str((args.output / "firmware.bin").resolve()) + '"\n.section .note.GNU-stack,"",@progbits\n')

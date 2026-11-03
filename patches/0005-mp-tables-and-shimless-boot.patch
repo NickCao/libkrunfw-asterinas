@@ -1,0 +1,594 @@
+--- a/kernel/core/comps/cmdline/src/early.rs
++++ b/kernel/core/comps/cmdline/src/early.rs
+@@ -21,7 +21,7 @@
+ /// Kernel command-line keys consumed by [`early_cmdline_parser`].
+ ///
+ /// These are stripped during dispatch so they are not forwarded to init.
+-const EARLY_PARAMS: &[&str] = &["earlycon", "loglevel"];
++const EARLY_PARAMS: &[&str] = &["earlycon", "loglevel", "quiet"];
+ 
+ /// Returns whether `key` is handled only by the early parser.
+ pub(super) fn is_early_param(key: &str) -> bool {
+@@ -38,11 +38,14 @@
+ /// - `earlycon` — enables the early UART console (exact token match).
+ /// - `loglevel=N` — sets the OSTD log filter (`N` in `0..=8`, see [`LevelFilter`]).
+ /// - `loglevel=LEVEL` — also accepts textual levels such as `error` or `debug`.
++/// - `quiet` — selects Linux's quiet console level (errors and more severe messages).
++/// - `console=ttyS0` — initializes the UART used by the normal serial TTY driver.
+ /// - `--` — stops parsing; all following tokens are for the init process.
+ ///
+ /// Double quotes (`"`) protect spaces inside one token (Linux-compatible).
+ /// Other tokens are ignored. When `loglevel` is absent, the default is `8`
+-/// ([`LevelFilter::Debug`]). When `earlycon` is absent, the early console stays disabled.
++/// ([`LevelFilter::Debug`]). `earlycon` or an explicit `console=ttyS0` initializes
++/// the UART, which is also needed by the normal serial TTY driver.
+ #[ostd::early_cmdline_parser]
+ const fn early_cmdline_parser(cmdline: &str) -> EarlyCmdline {
+     let mut has_early_console = false;
+@@ -74,11 +77,17 @@
+ 
+         let token = strip_linux_double_quotes(bytes, start, index);
+ 
+-        // Only early-only keys are consumed here; other tokens are ignored.
++        // Inspect settings needed before the normal parameter dispatcher runs.
+         if matches!(token, b"--") {
+             // `--` terminates kernel-side parsing; remaining tokens belong to init.
+             break;
+-        } else if matches!(token, b"earlycon") {
++        } else if matches!(token, b"earlycon" | b"console=ttyS0") {
++            has_early_console = true;
++        } else if matches!(token, b"quiet") {
++            log_level = LevelFilter::Error;
++        } else if let Some((key, _)) = token.split_at_checked(14)
++            && matches!(key, b"console=ttyS0,")
++        {
+             has_early_console = true;
+         } else if let Some((key, value)) = token.split_at_checked(9)
+             && matches!(key, b"loglevel=")
+@@ -178,6 +187,20 @@
+     }
+ 
+     #[ktest]
++    fn early_cmdline_parser_serial_console_and_quiet() {
++        let result = early_cmdline_parser("console=hvc0 console=ttyS0 quiet");
++        assert!(result.has_early_console);
++        assert_eq!(result.log_level, LevelFilter::Error);
++        assert!(early_cmdline_parser("console=ttyS0,115200").has_early_console);
++        assert!(!early_cmdline_parser("console=ttyS01").has_early_console);
++        assert!(!early_cmdline_parser("console=hvc0").has_early_console);
++        assert_eq!(
++            early_cmdline_parser("quiet loglevel=8").log_level,
++            LevelFilter::Debug
++        );
++    }
++
++    #[ktest]
+     fn early_cmdline_parser_loglevel() {
+         assert_eq!(
+             early_cmdline_parser("loglevel=0").log_level,
+--- a/kernel/core/src/arch/x86/power.rs
++++ b/kernel/core/src/arch/x86/power.rs
+@@ -18,6 +18,7 @@
+ // ACPI is attempted before legacy restart fallbacks, following Linux's x86 reset order.
+ // Reference: <https://elixir.bootlin.com/linux/v7.0/source/arch/x86/kernel/reboot.c#L657>
+ crate::register_restart_handler!(try_acpi_reset, crate::power::Priority::DEFAULT);
++crate::register_restart_handler!(ostd::arch::power::try_restart, crate::power::Priority::LOW);
+ 
+ crate::register_poweroff_handler!(
+     ostd::arch::power::try_poweroff,
+--- a/kernel/core/src/device/tty/device.rs
++++ b/kernel/core/src/device/tty/device.rs
+@@ -92,7 +92,7 @@
+             // TODO: Support specifying multiple TTY devices, e.g., "console=hvc0 console=tty0".
+             let console_name = CONSOLES
+                 .get()
+-                .and_then(|consoles| consoles.first().map(|s| s.as_str()))
++                .and_then(|consoles| consoles.last().map(|s| s.as_str()))
+                 .unwrap_or("tty0");
+ 
+             let device = match console_name {
+--- a/ostd/src/arch/x86/boot/mod.rs
++++ b/ostd/src/arch/x86/boot/mod.rs
+@@ -77,12 +77,19 @@
+         let kernel_cmdline = self.kernel_commandline();
+         let initramfs = self.initramfs();
+         let framebuffer_arg = self.framebuffer_arg();
++        let acpi_arg = self.acpi_arg();
++        if matches!(acpi_arg, BootloaderAcpiArg::ScanBios) {
++            // SAFETY: This boot path explicitly permits legacy BIOS discovery.
++            // The initial direct map covers low memory, and the regions found
++            // here are reserved by `finish_memory_regions` before allocation.
++            unsafe { super::kernel::mps::init() };
++        }
+ 
+         EarlyBootInfo {
+             bootloader_name: self.bootloader_name(),
+             kernel_cmdline: kernel_cmdline.unwrap_or(""),
+             initramfs,
+-            acpi_arg: self.acpi_arg(),
++            acpi_arg,
+             framebuffer_arg,
+             memory_regions: self.memory_regions(initramfs, kernel_cmdline, framebuffer_arg),
+         }
+@@ -104,6 +111,14 @@
+ 
+     // Add the kernel region since some loaders do not specify it.
+     regions.push(MemoryRegion::kernel()).unwrap();
++
++    if let Some(tables) = super::kernel::mps::get() {
++        for (address, len) in tables.reserved_regions() {
++            regions
++                .push(MemoryRegion::new(address, len, MemoryRegionType::Reserved))
++                .unwrap();
++        }
++    }
+ 
+     // Add the initramfs region.
+     if let Some(initramfs) = initramfs {
+--- a/ostd/src/arch/x86/boot/smp.rs
++++ b/ostd/src/arch/x86/boot/smp.rs
+@@ -50,10 +50,13 @@
+ 
+ /// Counts the number of processors.
+ ///
+-/// This function needs to be called after the OS initializes the ACPI table.
++/// This function needs to be called after firmware topology discovery.
+ pub(crate) fn count_processors() -> Option<u32> {
+-    let acpi_tables = get_acpi_tables()?;
+-    let madt_table = acpi_tables.find_table::<acpi::madt::Madt>().ok()?;
++    let Some(madt_table) =
++        get_acpi_tables().and_then(|tables| tables.find_table::<acpi::madt::Madt>().ok())
++    else {
++        return crate::arch::kernel::mps::get().map(|tables| tables.processor_count());
++    };
+ 
+     // According to ACPI spec [1], "If this bit [the Enabled bit] is set the processor is ready for
+     // use. If this bit is clear and the Online Capable bit is set, system hardware supports
+--- a/ostd/src/arch/x86/irq/chip/mod.rs
++++ b/ostd/src/arch/x86/irq/chip/mod.rs
+@@ -12,8 +12,12 @@
+ use spin::Once;
+ 
+ use crate::{
+-    Error, Result, arch::kernel::acpi::get_acpi_tables, info, io::IoMemAllocatorBuilder,
+-    irq::IrqLine, sync::SpinLock,
++    Error, Result,
++    arch::kernel::{acpi::get_acpi_tables, mps},
++    info,
++    io::IoMemAllocatorBuilder,
++    irq::IrqLine,
++    sync::SpinLock,
+ };
+ 
+ mod ioapic;
+@@ -163,12 +167,11 @@
+ pub static IRQ_CHIP: Once<IrqChip> = Once::new();
+ 
+ pub(in crate::arch) fn init(io_mem_builder: &IoMemAllocatorBuilder) {
+-    // If there are no ACPI tables, or the ACPI tables do not provide us with information about
+-    // the I/O APIC, we may need to find another way to determine the I/O APIC address
+-    // correctly and reliably (e.g., by parsing the MultiProcessor Specification, which has
+-    // been deprecated for a long time and may not even exist in modern hardware).
+-    let acpi_tables = get_acpi_tables().unwrap();
+-    let madt_table = acpi_tables.find_table::<Madt>().unwrap();
++    let Some(madt_table) = get_acpi_tables().and_then(|tables| tables.find_table::<Madt>().ok())
++    else {
++        init_from_mp_tables(io_mem_builder);
++        return;
++    };
+ 
+     init_and_disable_pic_if_present(madt_table.get());
+ 
+@@ -284,3 +287,64 @@
+         pic::init_and_disable();
+     }
+ }
++
++fn init_from_mp_tables(io_mem_builder: &IoMemAllocatorBuilder) {
++    let tables = mps::get().expect("neither an ACPI MADT nor valid Intel MP tables were found");
++    info!(
++        "Using Intel MP tables: {} processors",
++        tables.processor_count()
++    );
++    pic::init_for_mp(tables.imcr_present());
++
++    let mut io_apics = Vec::new();
++    let mut ids_and_bases = Vec::new();
++    let mut next_base = 0u32;
++    for entry in tables.io_apics() {
++        if io_apics
++            .iter()
++            .any(|existing: &IoApic| existing.address() == entry.address)
++        {
++            continue;
++        }
++        // SAFETY: The MP table is checksum-validated firmware information. Its
++        // I/O APIC address was checked to be non-zero and page-aligned. As in
++        // the MADT path, `IoApic::new` also rejects absent hardware registers.
++        let Some(io_apic) = (unsafe { IoApic::new(entry.address, next_base, io_mem_builder) })
++        else {
++            continue;
++        };
++        let Some(end) = io_apic.interrupt_end().checked_add(1) else {
++            continue;
++        };
++        ids_and_bases.push((entry.id, next_base, io_apic.interrupt_end()));
++        next_base = end;
++        io_apics.push(io_apic);
++    }
++    assert!(
++        !io_apics.is_empty(),
++        "no usable I/O APICs in Intel MP tables"
++    );
++
++    let mut isa_overrides = Vec::new();
++    for route in tables.isa_interrupts() {
++        let Some((_, base, end)) = ids_and_bases
++            .iter()
++            .find(|(id, _, _)| *id == route.io_apic_id)
++        else {
++            continue;
++        };
++        let target = *base + u32::from(route.input);
++        if target <= *end {
++            isa_overrides.push(IsaOverride {
++                source: route.source,
++                target,
++            });
++        }
++    }
++    // Explicit MP routes, including identity mappings, are authoritative. In
++    // particular, do not apply the MADT path's synthetic IRQ0-to-GSI2 fallback.
++    IRQ_CHIP.call_once(|| IrqChip {
++        io_apics: SpinLock::new(io_apics.into_boxed_slice()),
++        overrides: isa_overrides.into_boxed_slice(),
++    });
++}
+--- a/ostd/src/arch/x86/irq/chip/pic.rs
++++ b/ostd/src/arch/x86/irq/chip/pic.rs
+@@ -12,10 +12,24 @@
+         static MASTER_DATA: IoPort<u8, ReadWriteAccess> = IoPort::new(0x21);
+         static SLAVE_CMD: IoPort<u8, WriteOnlyAccess> = IoPort::new(0xA0);
+         static SLAVE_DATA: IoPort<u8, WriteOnlyAccess> = IoPort::new(0xA1);
++        static IMCR_INDEX: IoPort<u8, WriteOnlyAccess> = IoPort::new(0x22);
++        static IMCR_DATA: IoPort<u8, ReadWriteAccess> = IoPort::new(0x23);
+     }
+ }
+ 
+ const IRQ_OFFSET: u8 = 0x20;
++
++pub(super) fn init_for_mp(imcr_present: bool) {
++    if imcr_present || probe_legacy_pic() {
++        init_and_disable();
++    }
++    if imcr_present {
++        // Intel MP 1.4 section 3.6.2.1: switch from PIC routing to symmetric
++        // I/O mode only when firmware explicitly reports an IMCR.
++        IMCR_INDEX.write(0x70);
++        IMCR_DATA.write(IMCR_DATA.read() | 1);
++    }
++}
+ 
+ /// Probes whether a legacy 8259A PIC is present.
+ ///
+--- a/ostd/src/arch/x86/kernel/mod.rs
++++ b/ostd/src/arch/x86/kernel/mod.rs
+@@ -8,6 +8,7 @@
+ pub(super) mod acpi;
+ pub(super) mod apic;
+ pub(super) mod kvm_clock;
++pub(in crate::arch) mod mps;
+ pub(super) mod tsc;
+ 
+ pub use acpi::{ACPI_INFO, AcpiInfo};
+--- /dev/null
++++ b/ostd/src/arch/x86/kernel/mps.rs
+@@ -0,0 +1,288 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Legacy Intel MP tables for BIOS-compatible machines without an ACPI MADT.
++//!
++//! Discovery and validation run before the heap and frame allocators exist. The
++//! parsed view borrows firmware memory, which the boot code reserves before
++//! enabling the frame allocator. Explicit MP 1.1/1.4 base tables in conventional
++//! memory or BIOS ROM are supported; implicit default configurations are not.
++//! Reference: <https://pdos.csail.mit.edu/6.828/2018/readings/ia32/MPspec.pdf>.
++
++use spin::Once;
++
++use crate::mm::paddr_to_vaddr;
++
++static TABLES: Once<Option<MpTables>> = Once::new();
++
++pub(in crate::arch) struct MpTables {
++    floating_address: usize,
++    config_address: usize,
++    config_len: usize,
++    entries: &'static [u8],
++    processor_count: u32,
++    isa_buses: [u64; 4],
++    imcr_present: bool,
++}
++
++pub(in crate::arch) struct IoApicInfo {
++    pub id: u8,
++    pub address: usize,
++}
++
++pub(in crate::arch) struct IsaInterrupt {
++    pub source: u8,
++    pub io_apic_id: u8,
++    pub input: u8,
++}
++
++impl MpTables {
++    pub(in crate::arch) fn processor_count(&self) -> u32 {
++        self.processor_count
++    }
++
++    pub(in crate::arch) fn imcr_present(&self) -> bool {
++        self.imcr_present
++    }
++
++    pub(in crate::arch) fn reserved_regions(&self) -> [(usize, usize); 2] {
++        [
++            (self.floating_address, 16),
++            (self.config_address, self.config_len),
++        ]
++    }
++
++    fn entries(&self) -> impl Iterator<Item = &[u8]> {
++        entries(self.entries)
++    }
++
++    pub(in crate::arch) fn io_apics(&self) -> impl Iterator<Item = IoApicInfo> {
++        self.entries().filter_map(|entry| {
++            (entry[0] == 2 && entry[3] & 1 != 0).then(|| IoApicInfo {
++                id: entry[1],
++                address: u32_at(entry, 4).unwrap() as usize,
++            })
++        })
++    }
++
++    pub(in crate::arch) fn isa_interrupts(&self) -> impl Iterator<Item = IsaInterrupt> {
++        self.entries().filter_map(|entry| {
++            if entry[0] != 3 || entry[1] != 0 || !contains(&self.isa_buses, entry[4]) {
++                return None;
++            }
++            Some(IsaInterrupt {
++                source: entry[5],
++                io_apic_id: entry[6],
++                input: entry[7],
++            })
++        })
++    }
++}
++
++pub(in crate::arch) fn get() -> Option<&'static MpTables> {
++    TABLES.get().and_then(Option::as_ref)
++}
++
++/// Discovers explicit MP tables in legacy BIOS memory without allocating.
++///
++/// # Safety
++///
++/// The caller must be on the BSP before the frame allocator starts. The BIOS
++/// data area, conventional memory, and BIOS ROM below 1 MiB must be readable
++/// through the physical direct map and immutable until their reservations are
++/// installed. This function must only be used on a BIOS-compatible boot path.
++pub(in crate::arch) unsafe fn init() {
++    TABLES.call_once(|| {
++        // SAFETY: The caller guarantees access to legacy BIOS memory.
++        unsafe { find_tables() }
++    });
++}
++
++// All physical reads are confined to conventional memory and system BIOS ROM.
++fn valid_range(address: usize, len: usize) -> bool {
++    let Some(end) = address.checked_add(len) else {
++        return false;
++    };
++    address != 0 && (end <= 0xa0000 || (address >= 0xf0000 && end <= 0x100000))
++}
++
++/// # Safety
++/// The caller must uphold the legacy BIOS memory contract documented by `init`.
++unsafe fn bios_bytes(address: usize, len: usize) -> Option<&'static [u8]> {
++    if !valid_range(address, len) {
++        return None;
++    }
++    // SAFETY: The range is within the legacy memory the caller guarantees is
++    // mapped and readable. Accepted table regions are reserved before any frame
++    // allocations can overwrite them, preserving the returned immutable slice.
++    Some(unsafe { core::slice::from_raw_parts(paddr_to_vaddr(address) as *const u8, len) })
++}
++
++/// # Safety
++/// The caller must uphold the legacy BIOS memory contract documented by `init`.
++unsafe fn find_tables() -> Option<MpTables> {
++    // The MP specification searches the first KiB of EBDA, the final KiB of
++    // conventional RAM, and the system BIOS ROM, in that order.
++    // SAFETY: These two BIOS data-area fields are covered by the caller's contract.
++    let ebda = u16_at(unsafe { bios_bytes(0x40e, 2)? }, 0)? as usize * 16;
++    // SAFETY: As above, for the conventional-memory size field.
++    let ram_end = u16_at(unsafe { bios_bytes(0x413, 2)? }, 0)? as usize * 1024;
++    // Direct-boot VMMs may omit BIOS data-area fields while placing the MP
++    // pointer in the final KiB of the standard 640-KiB conventional-memory area.
++    let ram_end = if (0x10000..=0xa0000).contains(&ram_end) {
++        ram_end
++    } else {
++        0xa0000
++    };
++    for (start, len) in [
++        (ebda, 1024),
++        (ram_end.saturating_sub(1024), 1024),
++        (0xf0000, 0x10000),
++    ] {
++        if start & 15 != 0 || !valid_range(start, len) {
++            continue;
++        }
++        for address in (start..start + len).step_by(16) {
++            // SAFETY: Discovery reads only checked legacy BIOS ranges.
++            if let Some(tables) = unsafe { tables_at(address) } {
++                return Some(tables);
++            }
++        }
++    }
++    None
++}
++
++/// # Safety
++/// The caller must uphold the legacy BIOS memory contract documented by `init`.
++unsafe fn tables_at(address: usize) -> Option<MpTables> {
++    // SAFETY: `bios_bytes` validates the range within the caller's BIOS mapping.
++    let floating = unsafe { bios_bytes(address, 16)? };
++    if &floating[..4] != b"_MP_"
++        || floating[8] != 1
++        || !matches!(floating[9], 1 | 4)
++        || !checksum_valid(floating)
++        || floating[11] != 0
++    {
++        return None;
++    }
++    let config_address = u32_at(floating, 4)? as usize;
++    // SAFETY: The physical range is checked before the firmware header is read.
++    let header = unsafe { bios_bytes(config_address, 44)? };
++    if &header[..4] != b"PCMP" || !matches!(header[6], 1 | 4) {
++        return None;
++    }
++    let base_len = u16_at(header, 4)? as usize;
++    let extended_len = u16_at(header, 40)? as usize;
++    if base_len < 44 {
++        return None;
++    }
++    let config_len = base_len.checked_add(extended_len)?;
++    // SAFETY: Both table lengths are bounded by `bios_bytes`, including their sum.
++    let config = unsafe { bios_bytes(config_address, config_len)? };
++    if !checksum_valid(&config[..base_len])
++        || (extended_len != 0 && byte_sum(&config[base_len..]).wrapping_add(header[42]) != 0)
++    {
++        return None;
++    }
++    let local_apic_address = u32_at(header, 36)?;
++    if local_apic_address == 0 || local_apic_address & 0xfff != 0 {
++        return None;
++    }
++    let table_entries = &config[44..base_len];
++    let mut processor_count = 0;
++    let mut bootstrap_processors = 0;
++    let mut processor_ids = [0u64; 4];
++    let mut io_apic_ids = [0u64; 4];
++    let mut isa_buses = [0u64; 4];
++    let mut entry_count = 0;
++    let mut parsed_len = 0;
++    for entry in entries(table_entries) {
++        entry_count += 1;
++        parsed_len += entry.len();
++        match entry[0] {
++            0 if entry[3] & 1 != 0 => {
++                if entry[1] == 255 || !insert(&mut processor_ids, entry[1]) {
++                    return None;
++                }
++                processor_count += 1;
++                bootstrap_processors += u32::from(entry[3] & 2 != 0);
++            }
++            1 if &entry[2..8] == b"ISA   " => {
++                insert(&mut isa_buses, entry[1]);
++            }
++            2 if entry[3] & 1 != 0 => {
++                let io_apic_address = u32_at(entry, 4)?;
++                if entry[1] == 255
++                    || !insert(&mut io_apic_ids, entry[1])
++                    || io_apic_address == 0
++                    || io_apic_address & 0xfff != 0
++                {
++                    return None;
++                }
++            }
++            _ => {}
++        }
++    }
++    // Some Linux-compatible VMMs leave the entry-count field zero. Like Linux,
++    // walk complete entries up to the validated base-table length in that case.
++    let declared_count = u16_at(header, 34)?;
++    if parsed_len != table_entries.len()
++        || (declared_count != 0 && entry_count != declared_count)
++        || processor_count == 0
++        || bootstrap_processors != 1
++    {
++        return None;
++    }
++    Some(MpTables {
++        floating_address: address,
++        config_address,
++        config_len,
++        entries: table_entries,
++        processor_count,
++        isa_buses,
++        imcr_present: floating[12] & 0x80 != 0,
++    })
++}
++
++fn entries(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
++    let mut position = 0;
++    core::iter::from_fn(move || {
++        let len = match *bytes.get(position)? {
++            0 => 20,
++            1..=4 => 8,
++            _ => return None,
++        };
++        let entry = bytes.get(position..position + len)?;
++        position += len;
++        Some(entry)
++    })
++}
++
++fn u16_at(bytes: &[u8], offset: usize) -> Option<u16> {
++    Some(u16::from_le_bytes(
++        bytes.get(offset..offset + 2)?.try_into().ok()?,
++    ))
++}
++
++fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
++    Some(u32::from_le_bytes(
++        bytes.get(offset..offset + 4)?.try_into().ok()?,
++    ))
++}
++
++fn checksum_valid(bytes: &[u8]) -> bool {
++    byte_sum(bytes) == 0
++}
++
++fn byte_sum(bytes: &[u8]) -> u8 {
++    bytes.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte))
++}
++
++fn contains(set: &[u64; 4], id: u8) -> bool {
++    set[id as usize / 64] & (1u64 << (id % 64)) != 0
++}
++
++fn insert(set: &mut [u64; 4], id: u8) -> bool {
++    let present = contains(set, id);
++    set[id as usize / 64] |= 1u64 << (id % 64);
++    !present
++}
+--- a/ostd/src/arch/x86/power.rs
++++ b/ostd/src/arch/x86/power.rs
+@@ -66,7 +66,15 @@
+ 
+ /// Attempts to restart the system using an architecture-specific mechanism.
+ ///
+-/// On x86, this function currently does nothing and returns.
++/// On x86, this function issues the legacy keyboard-controller reset command.
++/// This also works with VMMs that expose the reset port without PS/2 devices.
+ pub fn try_restart(_code: crate::power::ExitCode) {
+-    // TODO: Add an OSTD-level restart mechanism for x86.
++    // SAFETY: This is the architecture's final restart mechanism, invoked only
++    // when the caller requests a machine reset. Writing the reset command is
++    // intentional even if an input driver owns the controller during normal
++    // operation; no driver state is reused after a successful machine reset.
++    unsafe {
++        core::arch::asm!("out dx, al", in("dx") 0x64u16, in("al") 0xfeu8,
++            options(nomem, nostack, preserves_flags));
++    }
+ }

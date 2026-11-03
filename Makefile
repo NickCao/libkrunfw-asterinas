@@ -17,7 +17,7 @@ $(BUILD)/run: src/run.c
 	mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $< -lkrun -ljson-c
 
-$(BUILD)/payload/layout.h: $(KERNEL) tools/pack.py src/entry.S src/boot.c src/boot.ld
+$(BUILD)/payload/layout.h: $(KERNEL) tools/pack.py
 	python3 tools/pack.py $(KERNEL) $(BUILD)/payload
 
 $(BUILD)/libkrunfw.so.5: src/firmware.c $(BUILD)/payload/layout.h

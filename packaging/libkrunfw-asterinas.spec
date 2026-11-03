@@ -3,7 +3,7 @@
 %global vdso_commit 8af571775a3d3a1df3e84fc9709b9d6b160c771a
 Name:           libkrunfw-asterinas
 Version:        0.1.0
-Release:        7%{?dist}
+Release:        8%{?dist}
 Summary:        Experimental Asterinas guest payload for libkrun
 License:        MIT AND MPL-2.0
 URL:            https://github.com/NickCao/libkrunfw-asterinas
@@ -35,8 +35,8 @@ Conflicts:      libkrunfw
 Provides:       bundled(asterinas) = 0.19.0
 
 %description
-A source-built Asterinas kernel wrapped in libkrunfw ABI 5, with minimal boot
-data. The kernel mounts the virtiofs root directly and starts stock libkrun's
+A source-built Asterinas kernel wrapped in libkrunfw ABI 5. Stock libkrun enters
+the kernel directly. The kernel mounts the virtiofs root and starts libkrun's
 guest init without an initramfs. Includes a one-vCPU C API launcher
 for testing an extracted container filesystem with Fedora's stock libkrun.
 Replaces the system libkrunfw. This is an experimental payload for the
@@ -75,6 +75,11 @@ cp -a patches %{buildroot}%{_datadir}/%{name}/patches
 %{_datadir}/%{name}/
 
 %changelog
+* Mon Nov 02 2026 Nick Cao <nickcao@nichi.co> - 0.1.0-8
+- Discover CPUs and I/O APICs from Intel MP tables when no ACPI MADT is available
+- Add a legacy reset fallback and honor the preferred serial console
+- Enter Asterinas directly without a guest boot shim or generated ACPI tables
+
 * Mon Nov 02 2026 Nick Cao <nickcao@nichi.co> - 0.1.0-7
 - Make direct virtiofs root boot the only firmware path and remove the custom init
 - Prepare standard device links and resolve the static gateway during kernel boot
